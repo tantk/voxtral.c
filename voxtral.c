@@ -42,6 +42,7 @@ double vox_get_time_ms(void) {
 
 /* Global verbose flag */
 int vox_verbose = 0;
+int vox_monitor = 0;
 
 /* ========================================================================
  * Decoder timing conditioning (t_cond + per-layer ada_scale)
@@ -387,6 +388,7 @@ void vox_free(vox_ctx_t *ctx) {
 #define TOKEN_BOS          1
 #define TOKEN_EOS          2
 #define TOKEN_STREAMING_PAD 32
+#define TOKEN_TEXT_MIN     1000
 
 #define RAW_AUDIO_LENGTH_PER_TOK 1280
 #define OFFLINE_STREAMING_BUFFER_TOKENS 10
@@ -402,6 +404,18 @@ void vox_free(vox_ctx_t *ctx) {
 
 /* Default processing interval in seconds (mel rate = 100 fps) */
 #define STREAM_DEFAULT_INTERVAL  2.0f
+
+/* Max decoder KV cache entries before forced restart on live streams.
+ * Bounds attention cost to keep decode steps under control. */
+#define STREAM_MAX_DECODE_KV  2000
+/* If the decoder keeps generating non-text/control tokens for too long,
+ * force a hard restart so live transcription can recover. */
+#define STREAM_MAX_NON_TEXT_STREAK  64
+/* If incoming audio advances but decoder emits no tokens for too long,
+ * force a full stream reset (mel+encoder+decoder state). */
+#define STREAM_MAX_NO_DECODE_SAMPLES  (VOX_SAMPLE_RATE * 20)
+/* Escalate to full stream reset after repeated no-text restarts. */
+#define STREAM_EMPTY_RESTARTS_FOR_FULL_RESET  2
 
 static void trim_ascii_whitespace(char *s) {
     if (!s) return;
@@ -434,7 +448,7 @@ struct vox_stream {
 
     /* Incremental mel */
     vox_mel_ctx_t *mel_ctx;
-    int real_samples_fed;
+    int64_t real_samples_fed;
 
     /* Encoder progress in mel frames */
     int mel_cursor;
@@ -468,7 +482,13 @@ struct vox_stream {
     int gen_pos;        /* next adapter position for generation */
     int prev_token;
     int eos_seen;
+    int nontext_streak;
+    int text_since_restart;
+    int empty_restarts;    /* consecutive restarts with no text emitted */
+    int waiting_prompt;
+    int64_t last_decode_sample; /* real_samples_fed at last decoder token */
     int finished;       /* vox_stream_finish() called */
+    int continuous;     /* live stream: auto-restart decoder on EOS / KV overflow */
 
     /* Stream lifecycle flags */
     int init_ok;        /* used to suppress stats printing for failed init */
@@ -496,8 +516,25 @@ struct vox_stream {
     double decoder_ms;
     double prefill_ms;
     int n_generated;
-    int n_text_tokens;          /* tokens with ID >= 1000 (visible text) */
+    int n_text_tokens;          /* tokens emitted as visible text */
 };
+
+typedef enum stream_tok_class {
+    STREAM_TOK_TEXT = 0,    /* decodes to a non-empty piece */
+    STREAM_TOK_CONTROL = 1, /* token ID below text range */
+    STREAM_TOK_INVALID = 2, /* text-range token with empty/invalid decode */
+    STREAM_TOK_EOS = 3
+} stream_tok_class_t;
+
+/* In Tekken, token 1000 is raw byte 0x00. As a C string this is empty.
+ * Treat empty decodes as non-text to avoid "decode activity but no output". */
+static stream_tok_class_t stream_classify_token(vox_stream_t *s, int token_id) {
+    if (token_id == TOKEN_EOS) return STREAM_TOK_EOS;
+    if (token_id < TOKEN_TEXT_MIN) return STREAM_TOK_CONTROL;
+    const char *piece = vox_tokenizer_decode(s->tokenizer, token_id);
+    if (!piece || piece[0] == '\0') return STREAM_TOK_INVALID;
+    return STREAM_TOK_TEXT;
+}
 
 /* Enqueue one token position. alts[0]=best, alts[1..VOX_MAX_ALT-1]=alternatives or NULL. */
 static void stream_enqueue_token(vox_stream_t *s, const char *alts[VOX_MAX_ALT]) {
@@ -825,12 +862,65 @@ static int stream_strict_eos(void) {
     return cached;
 }
 
-/* Run encoder on available mel, append adapter tokens */
+/* Reset decoder-side streaming state (hard reset: drop adapter backlog/context). */
+static void stream_reset_decoder_state(vox_stream_t *s) {
+    if (!s) return;
+
+    s->ctx->kv_cache_len = 0;
+    s->ctx->kv_pos_offset = 0;
+
+    s->total_adapter = 0;
+    s->adapter_pos_offset = 0;
+    s->gen_pos = 0;
+    s->decoder_started = 0;
+    s->prev_token = TOKEN_BOS;
+    s->eos_seen = 0;
+    s->n_generated = 0;
+    s->nontext_streak = 0;
+    s->text_since_restart = 0;
+    s->waiting_prompt = 0;
+}
+
+/* Reset full live-stream state (mel/conv/encoder/decoder). */
+static int stream_reset_full_state(vox_stream_t *s) {
+    if (!s) return -1;
+
+    vox_mel_ctx_t *new_mel = vox_mel_ctx_init(32 * RAW_AUDIO_LENGTH_PER_TOK);
+    if (!new_mel) return -1;
+
+    vox_mel_free(s->mel_ctx);
+    s->mel_ctx = new_mel;
+    s->mel_cursor = 0;
+
+    s->conv_stem_initialized = 0;
+    s->conv0_residual_count = 0;
+    s->enc_residual_count = 0;
+    if (s->mel_tail)
+        memset(s->mel_tail, 0, (size_t)VOX_MEL_BINS * 2 * sizeof(float));
+    if (s->conv0_tail)
+        memset(s->conv0_tail, 0, (size_t)VOX_ENC_DIM * 2 * sizeof(float));
+    if (s->conv0_residual)
+        memset(s->conv0_residual, 0, (size_t)VOX_ENC_DIM * sizeof(float));
+    if (s->enc_residual)
+        memset(s->enc_residual, 0, (size_t)3 * VOX_ENC_DIM * sizeof(float));
+
+    s->ctx->enc_kv_cache_len = 0;
+    s->ctx->enc_kv_pos_offset = 0;
+
+    stream_reset_decoder_state(s);
+    return 0;
+}
+
+/* Run encoder incrementally on available mel, append adapter tokens */
 static void stream_run_encoder(vox_stream_t *s) {
-    int total_mel = 0;
-    float *mel_data = vox_mel_data(s->mel_ctx, &total_mel);
+    int mel_frames = 0;
+    int mel_offset = vox_mel_frame_offset(s->mel_ctx);
+    float *mel_data = vox_mel_data(s->mel_ctx, &mel_frames);
+    int total_mel = mel_offset + mel_frames;
     int dim = VOX_DEC_DIM;
 
+    if (s->mel_cursor < mel_offset) s->mel_cursor = mel_offset;
+    int mel_start = s->mel_cursor - mel_offset;
     int new_mel = total_mel - s->mel_cursor;
 
     /* CUDA full encoder+adapter path: chunked re-encode with overlap. */
@@ -954,12 +1044,13 @@ static void stream_run_encoder(vox_stream_t *s) {
 
     /* 1. Run incremental conv stem on new mel -> post-conv positions */
     int conv_out_len = 0;
-    float *conv_out = stream_conv_stem(s, mel_data + (size_t)s->mel_cursor * VOX_MEL_BINS,
+    float *conv_out = stream_conv_stem(s, mel_data + (size_t)mel_start * VOX_MEL_BINS,
                                         new_mel, &conv_out_len);
     s->mel_cursor = total_mel;
 
     if (!conv_out || conv_out_len <= 0) {
         free(conv_out);
+        vox_mel_discard_before(s->mel_ctx, s->mel_cursor);
         return;
     }
 
@@ -970,6 +1061,7 @@ static void stream_run_encoder(vox_stream_t *s) {
 
     if (!enc_out || enc_out_len <= 0) {
         free(enc_out);
+        vox_mel_discard_before(s->mel_ctx, s->mel_cursor);
         return;
     }
 
@@ -1011,7 +1103,12 @@ static void stream_run_encoder(vox_stream_t *s) {
                 while (new_cap < phys_len + chunk_tokens) new_cap *= 2;
                 float *tmp = (float *)realloc(s->adapter_buf,
                     (size_t)new_cap * dim * sizeof(float));
-                if (!tmp) { free(adapter_chunk); free(enc_out); return; }
+                if (!tmp) {
+                    free(adapter_chunk);
+                    free(enc_out);
+                    vox_mel_discard_before(s->mel_ctx, s->mel_cursor);
+                    return;
+                }
                 s->adapter_buf = tmp;
                 s->adapter_cap = new_cap;
             }
@@ -1040,9 +1137,15 @@ static void stream_run_encoder(vox_stream_t *s) {
 
     s->encoder_ms += vox_get_time_ms() - t0;
 
+    if (vox_monitor) {
+        fprintf(stderr, "\xe2\x96\xb6");  /* ▶ = encoder chunk */
+        fflush(stderr);
+    }
     if (vox_verbose >= 2)
         fprintf(stderr, "  Encoder inc: %d mel -> %d conv -> %d usable (total adapter: %d, residual: %d)\n",
                 new_mel, conv_out_len, usable, s->total_adapter, leftover);
+
+    vox_mel_discard_before(s->mel_ctx, s->mel_cursor);
 }
 
 /* Build alternatives array from logits. alts[0]=best (already decoded as best_token).
@@ -1080,7 +1183,7 @@ static void stream_fill_alts(vox_stream_t *s, int best_token,
     while (found < s->n_alt) {
         int best_idx = -1;
         float best_p = -1;
-        for (int i = 1000; i < VOX_VOCAB_SIZE; i++) {
+        for (int i = TOKEN_TEXT_MIN; i < VOX_VOCAB_SIZE; i++) {
             if (i == best_token) continue;
             /* Skip already-picked */
             int skip = 0;
@@ -1113,8 +1216,19 @@ static void stream_run_decoder(vox_stream_t *s) {
     const int eos_is_terminal = (s->finished || stream_strict_eos());
     float *logits_out = (s->n_alt > 1) ? s->logits : NULL;
 
-    /* Prefill when we have enough adapter tokens */
-    if (!s->decoder_started && s->total_adapter >= prompt_len) {
+    /* Prefill when current adapter can cover the prompt. */
+    int cur_adapter = s->total_adapter - s->adapter_pos_offset;
+    if (!s->decoder_started && cur_adapter < prompt_len) {
+        if (vox_monitor && !s->waiting_prompt) {
+            /* ⌛ = waiting for enough adapter tokens to prefill prompt */
+            fprintf(stderr, "\xe2\x8c\x9b");
+            fflush(stderr);
+            s->waiting_prompt = 1;
+        }
+        return;
+    }
+    if (!s->decoder_started && cur_adapter >= prompt_len) {
+        s->waiting_prompt = 0;
         t0 = vox_get_time_ms();
 
         float *prompt_embeds = (float *)malloc((size_t)prompt_len * dim * sizeof(float));
@@ -1165,12 +1279,22 @@ static void stream_run_decoder(vox_stream_t *s) {
          * full-vocab logits back to host on CUDA. */
         s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
         s->n_generated++;
+        s->last_decode_sample = s->real_samples_fed;
 
-        /* Enqueue if it's a text token */
-        if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
+        /* Enqueue only if this token decodes to visible text */
+        stream_tok_class_t cls = stream_classify_token(s, s->prev_token);
+        if (cls == STREAM_TOK_TEXT) {
             const char *alts[VOX_MAX_ALT];
             stream_fill_alts(s, s->prev_token, alts);
-            if (alts[0]) { stream_enqueue_token(s, alts); s->n_text_tokens++; }
+            if (alts[0]) {
+                stream_enqueue_token(s, alts);
+                s->n_text_tokens++;
+                s->text_since_restart = 1;
+                s->empty_restarts = 0;
+            }
+            s->nontext_streak = 0;
+        } else if (cls != STREAM_TOK_EOS) {
+            s->nontext_streak++;
         }
         if (s->prev_token == TOKEN_EOS) {
             if (eos_is_terminal) {
@@ -1182,22 +1306,27 @@ static void stream_run_decoder(vox_stream_t *s) {
             }
         }
 
-        s->gen_pos = prompt_len;
+        s->gen_pos = s->adapter_pos_offset + prompt_len;
         s->decoder_started = 1;
 
         double pf_ms = vox_get_time_ms() - t0;
         s->decoder_ms += pf_ms;
         s->prefill_ms += pf_ms;
 
-        if (vox_verbose >= 2)
-            fprintf(stderr, "Decoder started (prefill %d, first token: %d)\n",
-                    prefill_count, s->prev_token);
+        if (vox_monitor) {
+            fprintf(stderr, "\xc2\xb7");  /* · = prefill */
+            fflush(stderr);
+        }
     }
 
     /* Generate tokens while adapter tokens are available */
     if (s->decoder_started && !s->eos_seen) {
         t0 = vox_get_time_ms();
         int gen_before = s->n_generated;
+        int text_steps = 0;
+        int control_steps = 0;
+        int invalid_steps = 0;
+        int eos_step = 0;
         while (s->gen_pos < s->total_adapter) {
             if (stream_use_cuda_pipeline_full()) {
 #ifdef USE_CUDA
@@ -1217,18 +1346,34 @@ static void stream_run_decoder(vox_stream_t *s) {
 
                 s->prev_token = vox_decoder_forward(s->ctx, s->step_embed, logits_out);
                 s->n_generated++;
+                s->last_decode_sample = s->real_samples_fed;
             }
 
-            if (s->prev_token != TOKEN_EOS && s->prev_token >= 1000) {
+            stream_tok_class_t cls = stream_classify_token(s, s->prev_token);
+            if (cls == STREAM_TOK_TEXT) {
                 const char *alts[VOX_MAX_ALT];
                 stream_fill_alts(s, s->prev_token, alts);
-                if (alts[0]) { stream_enqueue_token(s, alts); s->n_text_tokens++; }
+                if (alts[0]) {
+                    stream_enqueue_token(s, alts);
+                    s->n_text_tokens++;
+                    s->text_since_restart = 1;
+                    s->empty_restarts = 0;
+                }
+                s->nontext_streak = 0;
+                text_steps++;
+            } else if (cls == STREAM_TOK_CONTROL) {
+                s->nontext_streak++;
+                control_steps++;
+            } else if (cls == STREAM_TOK_INVALID) {
+                s->nontext_streak++;
+                invalid_steps++;
             }
 
             s->gen_pos++;
             if (s->prev_token == TOKEN_EOS) {
                 if (eos_is_terminal) {
                     s->eos_seen = 1;
+                    eos_step = 1;
                     break;
                 }
                 /* Provisional EOS: continue decoding using padding token. */
@@ -1236,12 +1381,97 @@ static void stream_run_decoder(vox_stream_t *s) {
             }
         }
         if (s->n_generated > gen_before) {
-            s->decoder_ms += vox_get_time_ms() - t0;
+            double dec_ms = vox_get_time_ms() - t0;
+            s->decoder_ms += dec_ms;
+            if (vox_monitor) {
+                int steps = s->n_generated - gen_before;
+                int slow = (dec_ms / steps > 40);
+                const char *sym;
+                const char *sev = "";
+                if (text_steps > 0) {
+                    /* ▪ = decode chunk with text, ▸ = slow text decode */
+                    sym = slow ? "\xe2\x96\xb8" : "\xe2\x96\xaa";
+                } else if (invalid_steps > 0) {
+                    /* ✗ = text-range token(s) with empty/invalid decode */
+                    sym = slow ? "\xe2\x9c\x98" : "\xe2\x9c\x97";
+                } else if (control_steps > 0) {
+                    /* ▫ = control chunk (token<1000), ▹ = slow control chunk */
+                    sym = slow ? "\xe2\x96\xb9" : "\xe2\x96\xab";
+                } else if (eos_step) {
+                    /* ◦ = EOS-only step */
+                    sym = "\xe2\x97\xa6";
+                } else {
+                    sym = "\xe2\x96\xaa";
+                }
+                if (text_steps == 0 && (control_steps > 0 || invalid_steps > 0)) {
+                    if (s->nontext_streak >= STREAM_MAX_NON_TEXT_STREAK - 8) {
+                        /* ☠ = critical non-text streak (restart imminent) */
+                        sev = "\xe2\x98\xa0";
+                    } else if (s->nontext_streak >= STREAM_MAX_NON_TEXT_STREAK / 2) {
+                        /* ⚠ = elevated non-text streak */
+                        sev = "\xe2\x9a\xa0";
+                    }
+                }
+                fprintf(stderr, "%s%s", sym, sev);
+                fflush(stderr);
+            }
         }
     }
 
     /* Reclaim adapter buffer space for tokens the decoder has consumed */
     stream_adapter_compact(s);
+
+    /* Restart decoder on live (non-finished) streams when:
+     * - EOS: model decided the segment is done
+     * - KV cache too large: bounds attention cost to keep real-time pace
+     * - non-text/invalid streak: catches decoder loops on control tokens
+     * - no decoder progress despite advancing audio: catches malformed state */
+    int need_restart = 0;
+    int full_reset = 0;
+    if (s->continuous) {
+        if (s->eos_seen)
+            need_restart = 1;
+        else if (s->decoder_started &&
+                 s->ctx->kv_cache_len > STREAM_MAX_DECODE_KV)
+            need_restart = 2;
+        else if (s->decoder_started &&
+                 s->nontext_streak >= STREAM_MAX_NON_TEXT_STREAK)
+            need_restart = 3;
+        else if (!s->finished &&
+                 (s->real_samples_fed - s->last_decode_sample) >=
+                 STREAM_MAX_NO_DECODE_SAMPLES)
+            need_restart = 4;
+    }
+    if (need_restart) {
+        if (s->text_since_restart) s->empty_restarts = 0;
+        else s->empty_restarts++;
+        if (need_restart >= 2 ||
+            s->empty_restarts >= STREAM_EMPTY_RESTARTS_FOR_FULL_RESET)
+            full_reset = 1;
+
+        if (vox_monitor) {
+            /* ↺ = restart on EOS, ⟳ = restart on KV overflow,
+             * ↯ = non-text stall, ⌚ = no-decode watchdog,
+             * ✂ = decoder hard reset, ♻ = full stream reset */
+            const char *sym = (need_restart == 1) ? "\xe2\x86\xba" :
+                              (need_restart == 2) ? "\xe2\x9f\xb3" :
+                              (need_restart == 3) ? "\xe2\x86\xaf" :
+                                                   "\xe2\x8c\x9a";
+            fprintf(stderr, "%s%s", sym,
+                    full_reset ? "\xe2\x99\xbb" : "\xe2\x9c\x82");
+            fflush(stderr);
+        }
+        if (full_reset) {
+            if (stream_reset_full_state(s) != 0) {
+                /* If mel reinit fails, keep live path running with decoder reset. */
+                stream_reset_decoder_state(s);
+            }
+            s->empty_restarts = 0;
+        } else {
+            stream_reset_decoder_state(s);
+        }
+        s->last_decode_sample = s->real_samples_fed;
+    }
 }
 
 vox_stream_t *vox_stream_init(vox_ctx_t *ctx) {
@@ -1335,8 +1565,9 @@ int vox_stream_finish(vox_stream_t *s) {
     vox_mel_finish(s->mel_ctx, 0);
 
     if (vox_verbose >= 2)
-        fprintf(stderr, "Stream finished: %d real samples (%.1f sec)\n",
-                s->real_samples_fed, (float)s->real_samples_fed / VOX_SAMPLE_RATE);
+        fprintf(stderr, "Stream finished: %lld real samples (%.1f sec)\n",
+                (long long)s->real_samples_fed,
+                (double)s->real_samples_fed / VOX_SAMPLE_RATE);
 
     /* Final pass after mel finalization */
     stream_run_encoder(s);
@@ -1691,8 +1922,8 @@ int vox_stream_flush(vox_stream_t *s) {
     /* Feed the same right padding that finish() uses, so the decoder can
      * push out tokens that are behind the delay window. */
     int n_delay_tokens = s->ctx->delay_tokens;
-    int align_pad = (RAW_AUDIO_LENGTH_PER_TOK -
-        (s->real_samples_fed % RAW_AUDIO_LENGTH_PER_TOK)) % RAW_AUDIO_LENGTH_PER_TOK;
+    int align_pad = (int)((RAW_AUDIO_LENGTH_PER_TOK -
+        (s->real_samples_fed % RAW_AUDIO_LENGTH_PER_TOK)) % RAW_AUDIO_LENGTH_PER_TOK);
     int n_right_pad_tokens = (n_delay_tokens + 1) + OFFLINE_STREAMING_BUFFER_TOKENS;
     int right_pad = align_pad + n_right_pad_tokens * RAW_AUDIO_LENGTH_PER_TOK;
 
@@ -1727,6 +1958,10 @@ void vox_set_processing_interval(vox_stream_t *s, float seconds) {
         s->chunk_new_mel = s->min_new_mel;
         if (s->chunk_new_mel < 50) s->chunk_new_mel = 50; /* minimum 0.5s */
     }
+}
+
+void vox_stream_set_continuous(vox_stream_t *s, int enable) {
+    if (s) s->continuous = enable;
 }
 
 void vox_set_delay(vox_ctx_t *ctx, int delay_ms) {
