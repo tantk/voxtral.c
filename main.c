@@ -512,9 +512,9 @@ int main(int argc, char **argv) {
         fputs("\n", stdout);
         fflush(stdout);
     } else if (use_stdin) {
-        /* Peek at first 4 bytes to detect WAV vs raw */
-        uint8_t hdr[4];
-        size_t hdr_read = fread(hdr, 1, 4, stdin);
+        /* Read enough to detect WAV vs raw and parse WAV header */
+        uint8_t hdr[4096];
+        size_t hdr_read = fread(hdr, 1, sizeof(hdr), stdin);
         if (hdr_read < 4) {
             fprintf(stderr, "Not enough data on stdin\n");
             vox_stream_free(s);
@@ -522,64 +522,72 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        if (memcmp(hdr, "RIFF", 4) == 0) {
-            /* WAV on stdin: buffer all, parse, feed in chunks */
-            size_t capacity = 1024 * 1024;
-            size_t size = 4;
-            uint8_t *buf = (uint8_t *)malloc(capacity);
-            if (!buf) { vox_stream_free(s); vox_free(ctx); return 1; }
-            memcpy(buf, hdr, 4);
+        /* Offset into hdr[] where PCM data starts (0 = raw s16le) */
+        size_t pcm_offset = 0;
 
-            while (1) {
-                if (size == capacity) {
-                    capacity *= 2;
-                    uint8_t *tmp = (uint8_t *)realloc(buf, capacity);
-                    if (!tmp) { free(buf); vox_stream_free(s); vox_free(ctx); return 1; }
-                    buf = tmp;
+        if (hdr_read >= 44 && memcmp(hdr, "RIFF", 4) == 0 &&
+            memcmp(hdr + 8, "WAVE", 4) == 0) {
+            /* Parse WAV header to find data chunk */
+            int wav_fmt = 0, wav_ch = 0, wav_rate = 0, wav_bits = 0;
+            const uint8_t *p = hdr + 12;
+            const uint8_t *end = hdr + hdr_read;
+            int found_data = 0;
+            while (p + 8 <= end) {
+                uint32_t csz = (uint32_t)(p[4] | (p[5]<<8) | (p[6]<<16) | (p[7]<<24));
+                if (memcmp(p, "fmt ", 4) == 0 && csz >= 16 && p + 8 + csz <= end) {
+                    wav_fmt  = p[8] | (p[9]<<8);
+                    wav_ch   = p[10] | (p[11]<<8);
+                    wav_rate  = p[12] | (p[13]<<8) | (p[14]<<16) | (p[15]<<24);
+                    wav_bits = p[22] | (p[23]<<8);
+                } else if (memcmp(p, "data", 4) == 0) {
+                    pcm_offset = (size_t)(p + 8 - hdr);
+                    found_data = 1;
+                    break;
                 }
-                size_t n = fread(buf + size, 1, capacity - size, stdin);
-                if (n == 0) break;
-                size += n;
+                if (p + 8 + csz > end) break;
+                p += 8 + csz;
+                if (csz & 1) p++;
             }
-
-            int n_samples = 0;
-            float *samples = vox_parse_wav_buffer(buf, size, &n_samples);
-            free(buf);
-            if (!samples) {
-                fprintf(stderr, "Invalid WAV data on stdin\n");
-                vox_stream_free(s);
-                vox_free(ctx);
-                return 1;
+            if (!found_data || wav_fmt != 1 || wav_bits != 16 || wav_ch < 1) {
+                fprintf(stderr, "Invalid WAV on stdin (fmt=%d bits=%d)\n",
+                        wav_fmt, wav_bits);
+                vox_stream_free(s); vox_free(ctx); return 1;
             }
-            if (vox_verbose >= 1)
-                fprintf(stderr, "Audio: %d samples (%.1f seconds)\n",
-                        n_samples, (float)n_samples / VOX_SAMPLE_RATE);
-
-            feed_and_drain(s, samples, n_samples);
-            free(samples);
+            if (wav_rate != VOX_SAMPLE_RATE || wav_ch != 1) {
+                fprintf(stderr, "WAV stdin streaming requires 16kHz mono "
+                        "(got %dHz %dch). Use: ffmpeg -i pipe:0 "
+                        "-ar 16000 -ac 1 -f s16le pipe:1\n", wav_rate, wav_ch);
+                vox_stream_free(s); vox_free(ctx); return 1;
+            }
+            if (vox_verbose >= 2)
+                fprintf(stderr, "Streaming WAV s16le 16kHz mono from stdin\n");
         } else {
-            /* Raw s16le 16kHz mono: stream incrementally */
             if (vox_verbose >= 2)
                 fprintf(stderr, "Streaming raw s16le 16kHz mono from stdin\n");
+        }
 
-            /* Feed the 4 peeked header bytes as 2 s16le samples */
-            int16_t sv[2];
-            memcpy(sv, hdr, 4);
-            float f[2] = { sv[0] / 32768.0f, sv[1] / 32768.0f };
-            vox_stream_feed(s, f, 2);
+        /* Feed any PCM data already in the header buffer */
+        size_t pcm_in_hdr = hdr_read - pcm_offset;
+        size_t pcm_frames = pcm_in_hdr / 2;
+        if (pcm_frames > 0) {
+            const int16_t *src = (const int16_t *)(hdr + pcm_offset);
+            float fbuf[2048];
+            for (size_t i = 0; i < pcm_frames; i++)
+                fbuf[i] = src[i] / 32768.0f;
+            vox_stream_feed(s, fbuf, (int)pcm_frames);
             drain_tokens(s);
+        }
 
-            /* Read loop */
-            int16_t raw_buf[4096];
-            float fbuf[4096];
-            while (1) {
-                size_t nread = fread(raw_buf, sizeof(int16_t), 4096, stdin);
-                if (nread == 0) break;
-                for (size_t i = 0; i < nread; i++)
-                    fbuf[i] = raw_buf[i] / 32768.0f;
-                vox_stream_feed(s, fbuf, (int)nread);
-                drain_tokens(s);
-            }
+        /* Stream the rest incrementally */
+        int16_t raw_buf[4096];
+        float fbuf[4096];
+        while (1) {
+            size_t nread = fread(raw_buf, sizeof(int16_t), 4096, stdin);
+            if (nread == 0) break;
+            for (size_t i = 0; i < nread; i++)
+                fbuf[i] = raw_buf[i] / 32768.0f;
+            vox_stream_feed(s, fbuf, (int)nread);
+            drain_tokens(s);
         }
 
         vox_stream_finish(s);

@@ -62,8 +62,7 @@ float *vox_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_sa
 
     while (p + 8 <= end) {
         uint32_t chunk_size = read_u32(p + 4);
-        if (p + 8 + chunk_size > end) break;
-        if (memcmp(p, "fmt ", 4) == 0 && chunk_size >= 16) {
+        if (memcmp(p, "fmt ", 4) == 0 && chunk_size >= 16 && p + 8 + chunk_size <= end) {
             audio_format = read_u16(p + 8);
             channels = read_u16(p + 10);
             sample_rate = read_u32(p + 12);
@@ -71,8 +70,12 @@ float *vox_parse_wav_buffer(const uint8_t *data, size_t file_size, int *out_n_sa
         } else if (memcmp(p, "data", 4) == 0) {
             pcm_data = p + 8;
             pcm_size = chunk_size;
-            if (pcm_data + pcm_size > end) pcm_size = (int)(end - pcm_data);
+            /* Piped ffmpeg writes 0xFFFFFFFF as data size (int -1); use rest of file */
+            if (pcm_size <= 0 || pcm_data + pcm_size > end)
+                pcm_size = (int)(end - pcm_data);
+            break; /* data is always last meaningful chunk */
         }
+        if (p + 8 + chunk_size > end) break;
         p += 8 + chunk_size;
         if (chunk_size & 1) p++;
     }
