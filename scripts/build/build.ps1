@@ -134,7 +134,7 @@ if ($CC -eq "gcc") {
     }
     if ($Cuda) {
         Write-Host "Generating CUDA kernel header..."
-        powershell.exe -ExecutionPolicy Bypass -File scripts\gen_cuda_header.ps1
+        powershell.exe -ExecutionPolicy Bypass -File "$PSScriptRoot\gen_cuda_header.ps1"
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
         $CFLAGS += "-DUSE_CUDA"
@@ -170,7 +170,7 @@ if ($CC -eq "gcc") {
     if ($Cuda) {
         Write-Host "Generating CUDA kernel header..."
         # Run in current session so MSVC environment is preserved
-        & (Join-Path $PSScriptRoot "scripts\gen_cuda_header.ps1")
+        & (Join-Path $PSScriptRoot "gen_cuda_header.ps1")
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
         
         $CFLAGS += "/DUSE_CUDA"

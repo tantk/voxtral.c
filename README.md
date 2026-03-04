@@ -10,7 +10,7 @@ Audio processing uses a chunked encoder with overlapping windows, bounding memor
 
 ## Motivations (and some rant)
 
-**Thank you to Mistral** for releasing such a great model in an Open Weights fashion. However, the author of this project believes that limiting the inference to a partnership with vLLM, without providing a self-contained reference implementation in Python, limits the model's actual reach and the potential good effects it could have. For this reason, this project was created: it provides both a pure C inference engine and a simple, self-contained Python reference implementation (`scripts/python_simple_implementation.py`) that anyone can read and understand without digging through the vLLM codebase.
+**Thank you to Mistral** for releasing such a great model in an Open Weights fashion. However, the author of this project believes that limiting the inference to a partnership with vLLM, without providing a self-contained reference implementation in Python, limits the model's actual reach and the potential good effects it could have. For this reason, this project was created: it provides both a pure C inference engine and a simple, self-contained Python reference implementation (`scripts/tools/python_simple_implementation.py`) that anyone can read and understand without digging through the vLLM codebase.
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ make mps       # Apple Silicon (fastest)
 # or: make cuda    # NVIDIA CUDA/cuBLAS (Linux/WSL2)
 
 # Download the model (~8.9GB)
-./scripts/download_model.sh
+./scripts/build/download_model.sh
 
 # Transcribe audio (tokens stream to stdout as generated)
 ./voxtral -d voxtral-model -i audio.wav
@@ -46,7 +46,7 @@ A self-contained Python implementation is also provided for reading and understa
 
 ```bash
 pip install torch safetensors soundfile soxr
-python scripts/python_simple_implementation.py voxtral-model audio.wav
+python scripts/tools/python_simple_implementation.py voxtral-model audio.wav
 ```
 
 This requires just PyTorch and a few standard libraries.
@@ -301,7 +301,7 @@ make inspect    # Build safetensors weight inspector
 Download model weights (~8.9GB) from HuggingFace:
 
 ```bash
-./scripts/download_model.sh
+./scripts/build/download_model.sh
 ```
 
 This downloads to `./voxtral-model/` containing:
@@ -416,10 +416,10 @@ If your RTX 3080 Ti is visible there, `make cuda` should work and Voxtral will o
 
 ```bash
 # Build + optional smoke test
-./scripts/validate_cuda.sh voxtral-model samples/test_speech.wav
+./scripts/test/validate_cuda.sh voxtral-model samples/test_speech.wav
 
 # Compare BLAS vs CUDA timing + output files
-./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
+./scripts/benchmark/benchmark_backends.sh voxtral-model samples/test_speech.wav
 ```
 
 Fast CUDA config is enabled by default (best-effort, can be overridden by per-feature env vars):
@@ -431,19 +431,19 @@ Fast CUDA config is enabled by default (best-effort, can be overridden by per-fe
 Notes:
 - Default fast mode enables a fused top1-only logits path when alternatives are disabled (`--alt` not used). Disable it with `VOX_DISABLE_CUDA_LOGITS_FUSED=1` if you want to benchmark the baseline logits+argmax path.
 - Default fast mode also enables the chunked attention v5 path by default (skips inactive chunks; best-effort). Disable it with `VOX_DISABLE_CUDA_ATTN_V5=1` (or force it with `VOX_CUDA_ATTN_V5=0/1`).
-- `VOX_CUDA_ATTN_V6=1` enables an experimental v6 attention variant that stores chunk partials in FP16 to reduce global bandwidth. This may change outputs slightly; use `./scripts/accuracy_regression.sh` to validate.
+- `VOX_CUDA_ATTN_V6=1` enables an experimental v6 attention variant that stores chunk partials in FP16 to reduce global bandwidth. This may change outputs slightly; use `./scripts/test/accuracy_regression.sh` to validate.
 - Default fast mode also enables the chunked attention v4 path as a fallback when v5 is unavailable/disabled (fused KV append into the v3 partial kernel, best-effort). Disable it with `VOX_DISABLE_CUDA_ATTN_V4=1`.
 - Default fast mode also enables the full CUDA streaming pipeline by default (keeps adapter embeddings on-device and builds step embeddings on GPU). Disable it with `VOX_CUDA_PIPELINE_FULL=0` (or `VOX_DISABLE_CUDA_PIPELINE_FULL=1`).
 - Default fast mode also enables cuBLASLt autotune for the `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_AUTOTUNE=1`.
 - Default fast mode also enables a cuBLASLt “transpose-B view” for `M=1` decoder GEMMs (best-effort). Disable it with `VOX_DISABLE_CUBLASLT_TRANSPOSE_B=1` (or force it with `VOX_CUDA_CUBLASLT_TRANSPOSE_B=0/1`).
 - `VOX_CUDA_CUBLASLT_MAX_WS_MB=auto|<MB>` controls the *max* cuBLASLt workspace allowed for heuristic selection (can unlock faster `M=1` kernels at the cost of some persistent VRAM). Default is modest; fast mode biases it higher automatically.
 - Override fast mode directly with `VOX_CUDA_FAST=0/1`, or disable with `VOX_DISABLE_CUDA_FAST=1`.
-- `VOX_CUDA_LT_COMPUTE=32F_FAST_16BF` (or similar) opts into alternate cuBLASLt compute modes for BF16 GEMMs (default: `32F`). This may change outputs slightly; use `./scripts/accuracy_regression.sh` to validate.
+- `VOX_CUDA_LT_COMPUTE=32F_FAST_16BF` (or similar) opts into alternate cuBLASLt compute modes for BF16 GEMMs (default: `32F`). This may change outputs slightly; use `./scripts/test/accuracy_regression.sh` to validate.
 
 To run the extra CUDA benchmark variants (graphs/v3/merged/etc):
 
 ```bash
-VOX_BENCH_CUDA_OPTS=1 ./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
+VOX_BENCH_CUDA_OPTS=1 ./scripts/benchmark/benchmark_backends.sh voxtral-model samples/test_speech.wav
 ```
 
 
@@ -472,7 +472,7 @@ If `pulse` is unavailable in your WSL distribution, use a host-side capture path
 
 ```bash
 # Compares BLAS vs CUDA transcripts with token mismatch tolerance (default: 0.5%)
-./scripts/accuracy_regression.sh voxtral-model samples/test_speech.wav 0.005
+./scripts/test/accuracy_regression.sh voxtral-model samples/test_speech.wav 0.005
 ```
 
 ### CUDA / WSL2 Notes

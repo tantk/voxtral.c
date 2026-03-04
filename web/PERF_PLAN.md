@@ -36,7 +36,7 @@ We benchmark two local clips:
 And optionally benchmark against the hosted API (Mistral) for the same clips to
 establish a target.
 
-Script: `scripts/benchmark_local_vs_mistral.sh`
+Script: `scripts/benchmark/benchmark_local_vs_mistral.sh`
 
 ## Recent Findings (RTX 3080 Ti / WSL2)
 
@@ -76,13 +76,13 @@ Ordered roughly by "likely to improve perceived latency" first, then throughput.
 
 4. Quantization (bigger speedup, higher risk)
    - INT8/FP8 for LM head / decoder blocks can reduce compute and memory bandwidth
-   - Requires accuracy regression checks (`scripts/accuracy_regression.sh`) and careful gating
+   - Requires accuracy regression checks (`scripts/test/accuracy_regression.sh`) and careful gating
 
 ## Validation / Definition of Done
 
 For each change:
 
-1. Run `scripts/benchmark_local_vs_mistral.sh` and record:
+1. Run `scripts/benchmark/benchmark_local_vs_mistral.sh` and record:
    - local `infer_ms` and `X-Voxtral-xRT` for both clips
    - (optional) hosted API wall time for both clips
 2. Ensure transcripts still look correct (spot check) and regressions are caught.

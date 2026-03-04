@@ -32,7 +32,9 @@ MISTRAL_MODEL_RESOLVED=""
 
 LOCAL_MODEL_LABEL="${LOCAL_MODEL_LABEL:-mistralai/Voxtral-Mini-4B-Realtime-2602}"
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+. "$(dirname "$0")/../paths.sh"
+
+ROOT="$REPO_ROOT"
 
 need() {
   command -v "$1" >/dev/null 2>&1 || { echo "missing dependency: $1" >&2; exit 1; }

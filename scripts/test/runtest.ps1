@@ -1,9 +1,11 @@
 # runtest.ps1 - Voxtral regression test for Windows
 # Requires: ffmpeg, voxtral.exe, voxtral-model directory.
 
-$MODEL_DIR = "voxtral-model"
-$INPUT = "samples/jfk.wav"
-$VOXTRAL = ".\voxtral.exe"
+. "$PSScriptRoot\..\paths.ps1"
+
+$MODEL_DIR = $ModelDir
+$INPUT = $JfkSample
+$VOXTRAL = $Voxtral
 $global:PASS = 0
 $global:FAIL = 0
 

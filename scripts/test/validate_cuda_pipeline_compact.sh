@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_DIR="${1:-voxtral-model}"
-SAMPLE_FILE="${2:-samples/antirez_speaking_italian_short.ogg}"
+. "$(dirname "$0")/../paths.sh"
+
+MODEL_DIR="${1:-$MODEL_DIR}"
+SAMPLE_FILE="${2:-$ITALIAN_SAMPLE}"
 
 make cuda
 

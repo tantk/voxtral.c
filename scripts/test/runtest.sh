@@ -10,9 +10,11 @@
 
 set -e
 
-MODEL_DIR="voxtral-model"
-OGG="samples/antirez_speaking_italian_short.ogg"
-VOXTRAL="./voxtral"
+. "$(dirname "$0")/../paths.sh"
+
+MODEL_DIR="${MODEL_DIR}"
+OGG="$ITALIAN_SAMPLE"
+VOXTRAL="$VOXTRAL_BIN"
 TMPWAV="/tmp/voxtral_test_$$.wav"
 PASS=0
 FAIL=0

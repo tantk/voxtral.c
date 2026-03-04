@@ -65,13 +65,13 @@ make blas
 ## Validation
 
 ```bash
-./scripts/download_model.sh
+./scripts/build/download_model.sh
 
 make cuda
-./scripts/validate_cuda.sh voxtral-model samples/test_speech.wav
+./scripts/test/validate_cuda.sh voxtral-model samples/test_speech.wav
 
-./scripts/accuracy_regression.sh voxtral-model samples/test_speech.wav 0
-./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav
+./scripts/test/accuracy_regression.sh voxtral-model samples/test_speech.wav 0
+./scripts/benchmark/benchmark_backends.sh voxtral-model samples/test_speech.wav
 ```
 
 ## Benchmarks (WSL2 RTX 3080 Ti)
@@ -81,7 +81,7 @@ All runs below are from the CLI. Stage timings are printed with `VOX_PRINT_TIMIN
 - `Encoder:` is the cumulative encoder+adapter time.
 - `Decoder:` is the cumulative decoder time.
 - `Wall transcribe:` is total transcription wall time (excluding `Model load:`).
-- `Total (load+transcribe):` is a derived sum printed by `scripts/benchmark_backends.sh` for comparisons that include model load in the end-to-end time.
+- `Total (load+transcribe):` is a derived sum printed by `scripts/benchmark/benchmark_backends.sh` for comparisons that include model load in the end-to-end time.
 - `prefill` (in the `Decoder:` line) includes prompt prefill plus the first generated token step (the timing block wraps both).
 
 Audio durations:
@@ -90,14 +90,14 @@ Audio durations:
 
 ### `samples/test_speech.wav`
 
-BLAS (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
+BLAS (`./scripts/benchmark/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
 - Model load: `75 ms`
 - Wall transcribe: `40918 ms`
 - Total (load+transcribe): `40993 ms`
 - Encoder: `760 mel -> 95 tokens (13864 ms)`
 - Decoder: `17 text tokens (57 steps) in 27046 ms (prefill 7772 ms + 344.2 ms/step)`
 
-CUDA (`./scripts/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
+CUDA (`./scripts/benchmark/benchmark_backends.sh voxtral-model samples/test_speech.wav`):
 - Model load: `31 ms`
 - Wall transcribe: `3045 ms`
 - Total (load+transcribe): `3076 ms`
@@ -183,7 +183,7 @@ VOX_CUDA_ATTN_V6=1
 
 Notes:
 - v6 is implemented for FP16 KV cache only (`VOX_CUDA_KV_FP16=1`, which is the default).
-- v6 stores `out_part` in FP16 (instead of FP32) to reduce global memory traffic. This may change outputs slightly; validate with `./scripts/accuracy_regression.sh`.
+- v6 stores `out_part` in FP16 (instead of FP32) to reduce global memory traffic. This may change outputs slightly; validate with `./scripts/test/accuracy_regression.sh`.
 - On the RTX 3080 Ti (WSL2) this did not materially improve wall-clock for `/tmp/vox_iad.wav`, so it remains opt-in for now.
 
 On `/tmp/vox_iad.wav` (~180s WAV) with `VOX_CUDA_FAST=1`:
@@ -272,7 +272,7 @@ Notes:
 - If it fails mid-run, we currently fail-fast rather than attempting a CPU fallback.
 - Prompt prefill still copies only the first prompt window from device to host to reuse the existing prefill path.
 - In pipeline mode, GPU conv stem is attempted by default unless disabled (`VOX_DISABLE_CUDA_CONV_STEM=1`).
-- Concurrency smoke test: `./scripts/stress_cuda_two_streams.sh voxtral-model samples/test_speech.wav`
+- Concurrency smoke test: `./scripts/test/stress_cuda_two_streams.sh voxtral-model samples/test_speech.wav`
 
 Related env vars:
 - `VOX_DISABLE_CUDA_PIPELINE_FULL=1` disables the pipeline.

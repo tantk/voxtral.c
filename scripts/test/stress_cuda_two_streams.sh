@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_DIR="${1:-voxtral-model}"
-SAMPLE_FILE="${2:-samples/test_speech.wav}"
+. "$(dirname "$0")/../paths.sh"
+
+MODEL_DIR="${1:-$MODEL_DIR}"
+SAMPLE_FILE="${2:-$TEST_SAMPLE}"
 
 make cuda
 
@@ -23,7 +25,7 @@ fi
 BIN="/tmp/voxtral_stress_two_streams"
 OBJ="/tmp/voxtral_stress_two_streams.o"
 
-gcc -O2 -Wall -Wextra -pthread -I. -c -o "$OBJ" scripts/stress_two_streams.c
+gcc -O2 -Wall -Wextra -pthread -I. -c -o "$OBJ" scripts/test/stress_two_streams.c
 gcc -o "$BIN" \
   "$OBJ" \
   voxtral.o voxtral_kernels.o voxtral_audio.o voxtral_encoder.o voxtral_decoder.o voxtral_tokenizer.o \

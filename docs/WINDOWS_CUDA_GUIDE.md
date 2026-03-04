@@ -11,31 +11,31 @@ This guide explains how to build and use Voxtral on Windows, with optional NVIDI
 
 ## Building
 
-The project uses a unified `scripts/build.ps1` script that automatically detects your Visual Studio environment.
+The project uses a unified `scripts/build/build.ps1` script that automatically detects your Visual Studio environment.
 
 ## Downloading The Model
 
 Download the Voxtral model into `voxtral-model/`:
 ```powershell
-.\scripts\download_model.ps1
+.\scripts\build\download_model.ps1
 ```
 
 ### 1. Build with CUDA (Recommended)
 This enables GPU acceleration for the encoder and decoder, providing near-instant transcription.
 ```powershell
-.\scripts\build.ps1 -Cuda
+.\scripts\build\build.ps1 -Cuda
 ```
 *Note: This will automatically generate CUDA kernel headers targeting your specific GPU architecture.*
 
 ### 2. Build for CPU only
 ```powershell
-.\scripts\build.ps1
+.\scripts\build\build.ps1
 ```
 
 ### 3. Clean Build
 If you encounter issues, perform a clean build:
 ```powershell
-.\scripts\build.ps1 -Clean -Cuda
+.\scripts\build\build.ps1 -Clean -Cuda
 ```
 
 ## Using Voxtral
@@ -77,6 +77,6 @@ In `--debug` mode, you can monitor how the system is keeping up:
 ## Regression Testing
 To verify that your build is working correctly and producing accurate text:
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\runtest.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\test\runtest.ps1
 ```
 This script checks batch-cpu, batch-cuda, and streaming modes against known phrases.

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_DIR="${1:-voxtral-model}"
-SAMPLE_FILE="${2:-samples/test_speech.wav}"
+. "$(dirname "$0")/../paths.sh"
+
+MODEL_DIR="${1:-$MODEL_DIR}"
+SAMPLE_FILE="${2:-$TEST_SAMPLE}"
 TOLERANCE_RATIO="${3:-0.005}"   # 0.5% token mismatch tolerance
 
 if [[ ! -d "$MODEL_DIR" ]]; then

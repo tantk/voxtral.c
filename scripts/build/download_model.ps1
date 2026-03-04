@@ -7,10 +7,12 @@
 # - Uses curl.exe for resumable downloads (avoid PowerShell's curl alias).
 
 param(
-    [string]$Dir = "voxtral-model"
+    [string]$Dir
 )
 
-$ModelId = "mistralai/Voxtral-Mini-4B-Realtime-2602"
+. "$PSScriptRoot\..\paths.ps1"
+
+if (-not $Dir) { $Dir = $ModelDir }
 $Files = @(
     "consolidated.safetensors",
     "params.json",

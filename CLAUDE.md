@@ -31,10 +31,10 @@ cat audio.wav | ./voxtral -d voxtral-model --stdin
 ffmpeg -i samples/I_have_a_dream.ogg -f s16le -ar 16000 -ac 1 - | ./voxtral -d voxtral-model --stdin
 
 # Download model (~8.9GB)
-./scripts/download_model.sh
+./scripts/build/download_model.sh
 
 # Python reference implementation (self-contained, no mistral_common needed)
-./pyenv312/bin/python scripts/python_simple_implementation.py voxtral-model test_speech.wav
+./pyenv312/bin/python scripts/tools/python_simple_implementation.py voxtral-model test_speech.wav
 ```
 
 ## Key Files
@@ -53,7 +53,7 @@ voxtral_mic.h               - Microphone capture API
 voxtral_mic_macos.c         - macOS mic capture (AudioQueue)
 voxtral_metal.m/.h          - Metal GPU backend
 voxtral_shaders.metal       - Metal compute shaders
-scripts/python_simple_implementation.py - Self-contained Python reference
+scripts/tools/python_simple_implementation.py - Self-contained Python reference
 docs/MODEL.md               - Architecture & weight format reference
 vllm/                       - Upstream vLLM clone (official reference)
 ```

@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-MODEL_DIR="${1:-voxtral-model}"
-SAMPLE_FILE="${2:-samples/test_speech.wav}"
+. "$(dirname "$0")/../paths.sh"
+
+MODEL_DIR="${1:-$MODEL_DIR}"
+SAMPLE_FILE="${2:-$TEST_SAMPLE}"
 
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "[warn] nvidia-smi not found; CUDA runtime visibility cannot be verified"
