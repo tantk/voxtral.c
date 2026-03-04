@@ -98,6 +98,15 @@ typedef struct {
     float *w3_weight;        /* [5120, 1280] up - f32 (NULL if bf16) */
     uint16_t *w3_weight_bf16;/* [5120, 1280] - bf16 mmap direct */
     float *ffn_norm;         /* [1280] */
+
+    /* Quantized weight pointers (non-NULL when loaded from VQF file) */
+    void *wq_weight_q;       int wq_qtype;   int64_t wq_numel;
+    void *wk_weight_q;       int wk_qtype;   int64_t wk_numel;
+    void *wv_weight_q;       int wv_qtype;   int64_t wv_numel;
+    void *wo_weight_q;       int wo_qtype;   int64_t wo_numel;
+    void *w1_weight_q;       int w1_qtype;   int64_t w1_numel;
+    void *w2_weight_q;       int w2_qtype;   int64_t w2_numel;
+    void *w3_weight_q;       int w3_qtype;   int64_t w3_numel;
 } vox_enc_layer_t;
 
 typedef struct {
@@ -142,6 +151,15 @@ typedef struct {
     float *w3_weight;        /* [9216, 3072] up - f32 (NULL if bf16) */
     uint16_t *w3_weight_bf16;/* [9216, 3072] - bf16 mmap direct */
     float *ffn_norm;         /* [3072] */
+
+    /* Quantized weight pointers (non-NULL when loaded from VQF file) */
+    void *wq_weight_q;       int wq_qtype;   int64_t wq_numel;
+    void *wk_weight_q;       int wk_qtype;   int64_t wk_numel;
+    void *wv_weight_q;       int wv_qtype;   int64_t wv_numel;
+    void *wo_weight_q;       int wo_qtype;   int64_t wo_numel;
+    void *w1_weight_q;       int w1_qtype;   int64_t w1_numel;
+    void *w2_weight_q;       int w2_qtype;   int64_t w2_numel;
+    void *w3_weight_q;       int w3_qtype;   int64_t w3_numel;
 } vox_dec_layer_t;
 
 typedef struct {
@@ -197,6 +215,10 @@ typedef struct {
 
     /* BF16 direct mmap mode (weights stay as bf16, convert on-the-fly) */
     int use_bf16;
+
+    /* VQF quantized model file (kept open for mmap, NULL if using safetensors) */
+    void *vqf_file;          /* vqf_mapped_file_t* */
+    int use_quant;           /* 1 if loaded from VQF file */
 
     /* Encoder KV cache (rolling: compacted at window=750) */
     float *enc_kv_cache_k;    /* [ENC_LAYERS, max_seq, enc_kv_dim] */
@@ -303,6 +325,12 @@ void vox_stream_set_continuous(vox_stream_t *s, int enable);
 /* Force the encoder to process whatever audio is buffered, regardless of the
  * processing interval. Useful for flushing on silence detection. */
 int vox_stream_flush(vox_stream_t *s);
+
+/* End the current utterance: flush + mel finalization + final encoder/decoder
+ * pass to capture trailing audio, but keep the stream alive for the next
+ * utterance. Unlike vox_stream_finish(), the stream remains usable — call
+ * vox_stream_reset_encoder() before feeding the next utterance. */
+int vox_stream_end_utterance(vox_stream_t *s);
 
 /* Free streaming context and all resources. */
 void vox_stream_free(vox_stream_t *s);

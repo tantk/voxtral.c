@@ -14,6 +14,7 @@
 
 #include "voxtral.h"
 #include "voxtral_kernels.h"
+#include "voxtral_quant.h"
 #include "voxtral_safetensors.h"
 #ifdef USE_METAL
 #include "voxtral_metal.h"
@@ -22,6 +23,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* Helper: add bias vector to each row of output */
+static void enc_add_bias(float *y, const float *b, int seq_len, int out_dim) {
+    for (int s = 0; s < seq_len; s++) {
+        float *row = y + (size_t)s * out_dim;
+        for (int j = 0; j < out_dim; j++)
+            row[j] += b[j];
+    }
+}
+
+/* Dispatch quantized or bf16 linear (no bias) */
+#define ENC_LINEAR(out, in, field, seq, in_d, out_d) \
+    do { \
+        if (l->field##_weight_q) \
+            vox_linear_nobias_quant(out, in, l->field##_weight_q, seq, in_d, out_d, l->field##_qtype); \
+        else \
+            vox_linear_nobias_bf16(out, in, l->field##_weight_bf16, seq, in_d, out_d); \
+    } while (0)
+
+/* Dispatch quantized or bf16 linear (with bias) */
+#define ENC_LINEAR_BIAS(out, in, field, bias, seq, in_d, out_d) \
+    do { \
+        if (l->field##_weight_q) { \
+            vox_linear_nobias_quant(out, in, l->field##_weight_q, seq, in_d, out_d, l->field##_qtype); \
+            enc_add_bias(out, bias, seq, out_d); \
+        } else { \
+            vox_linear_bf16(out, in, l->field##_weight_bf16, bias, seq, in_d, out_d); \
+        } \
+    } while (0)
 
 /* ========================================================================
  * Weight Loading
@@ -223,9 +253,9 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
             }
         } else {
 #endif
-            vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, seq_len, dim, qkv_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, qkv_dim);
-            vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, seq_len, dim, qkv_dim);
+            ENC_LINEAR_BIAS(q, x_norm, wq, l->wq_bias, seq_len, dim, qkv_dim);
+            ENC_LINEAR(k, x_norm, wk, seq_len, dim, qkv_dim);
+            ENC_LINEAR_BIAS(v, x_norm, wv, l->wv_bias, seq_len, dim, qkv_dim);
 #ifdef USE_METAL
         }
 #endif
@@ -261,7 +291,7 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
                     proj_out[s * dim + j] += l->wo_bias[j];
         } else {
 #endif
-            vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, seq_len, qkv_dim, dim);
+            ENC_LINEAR_BIAS(proj_out, attn_out, wo, l->wo_bias, seq_len, qkv_dim, dim);
 #ifdef USE_METAL
         }
 #endif
@@ -282,11 +312,11 @@ float *vox_encoder_forward(vox_ctx_t *ctx, const float *mel,
                     ffn_out[s * dim + j] += l->w2_bias[j];
         } else {
 #endif
-            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
+            ENC_LINEAR(gate, x_norm, w1, seq_len, dim, hidden);
             vox_silu(gate, seq_len * hidden);
-            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
+            ENC_LINEAR(up, x_norm, w3, seq_len, dim, hidden);
             vox_mul_inplace(gate, up, seq_len * hidden);
-            vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, seq_len, hidden, dim);
+            ENC_LINEAR_BIAS(ffn_out, gate, w2, l->w2_bias, seq_len, hidden, dim);
 #ifdef USE_METAL
         }
 #endif
@@ -539,9 +569,9 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
             }
         } else {
 #endif
-            vox_linear_bf16(q, x_norm, l->wq_weight_bf16, l->wq_bias, new_len, dim, qkv_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, new_len, dim, qkv_dim);
-            vox_linear_bf16(v, x_norm, l->wv_weight_bf16, l->wv_bias, new_len, dim, qkv_dim);
+            ENC_LINEAR_BIAS(q, x_norm, wq, l->wq_bias, new_len, dim, qkv_dim);
+            ENC_LINEAR(k, x_norm, wk, new_len, dim, qkv_dim);
+            ENC_LINEAR_BIAS(v, x_norm, wv, l->wv_bias, new_len, dim, qkv_dim);
 #ifdef USE_METAL
         }
 #endif
@@ -589,7 +619,7 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
                     proj_out[s * dim + j] += l->wo_bias[j];
         } else {
 #endif
-            vox_linear_bf16(proj_out, attn_out, l->wo_weight_bf16, l->wo_bias, new_len, qkv_dim, dim);
+            ENC_LINEAR_BIAS(proj_out, attn_out, wo, l->wo_bias, new_len, qkv_dim, dim);
 #ifdef USE_METAL
         }
 #endif
@@ -609,11 +639,11 @@ float *vox_encoder_forward_incremental(vox_ctx_t *ctx, const float *x_new,
                     ffn_out[s * dim + j] += l->w2_bias[j];
         } else {
 #endif
-            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, new_len, dim, hidden);
+            ENC_LINEAR(gate, x_norm, w1, new_len, dim, hidden);
             vox_silu(gate, new_len * hidden);
-            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, new_len, dim, hidden);
+            ENC_LINEAR(up, x_norm, w3, new_len, dim, hidden);
             vox_mul_inplace(gate, up, new_len * hidden);
-            vox_linear_bf16(ffn_out, gate, l->w2_weight_bf16, l->w2_bias, new_len, hidden, dim);
+            ENC_LINEAR_BIAS(ffn_out, gate, w2, l->w2_bias, new_len, hidden, dim);
 #ifdef USE_METAL
         }
 #endif

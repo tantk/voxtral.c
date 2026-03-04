@@ -8,10 +8,12 @@
 #include "voxtral.h"
 #include "voxtral_kernels.h"
 #include "voxtral_safetensors.h"
+#include "voxtral_quant_loader.h"
 #include "voxtral_audio.h"
 #include "voxtral_tokenizer.h"
 #ifdef USE_CUDA
 #include "voxtral_cuda.h"
+#include "voxtral_cuda_quant.h"
 #endif
 #ifdef USE_METAL
 #include "voxtral_metal.h"
@@ -141,43 +143,82 @@ vox_ctx_t *vox_load(const char *model_dir) {
     ctx->delay_tokens = 6; /* 480ms default */
     ctx->use_bf16 = 1; /* bf16 mmap direct mode */
 
-    /* Open safetensors file */
+    /* Try VQF quantized file first, fall back to safetensors */
     char path[1024];
-    snprintf(path, sizeof(path), "%s/consolidated.safetensors", model_dir);
+    snprintf(path, sizeof(path), "%s/consolidated.vqf", model_dir);
 
-    if (vox_verbose >= 2)
-        fprintf(stderr, "Loading model from %s\n", path);
+    vqf_mapped_file_t *vf = vqf_open(path);
+    if (vf) {
+        /* ---- Quantized VQF path ---- */
+        ctx->vqf_file = vf;
+        ctx->use_quant = 1;
+        ctx->use_bf16 = 0;
 
-    safetensors_file_t *sf = safetensors_open(path);
-    if (!sf) {
-        fprintf(stderr, "vox_load: cannot open %s\n", path);
-        free(ctx);
-        return NULL;
-    }
-    ctx->safetensors = sf;
+        if (vox_verbose >= 1)
+            fprintf(stderr, "Loading quantized weights from VQF...\n");
 
-    if (vox_verbose >= 1)
-        fprintf(stderr, "Loading weights...\n");
-    if (vox_encoder_load(&ctx->encoder, sf) != 0) {
-        fprintf(stderr, "vox_load: failed to load encoder\n");
-        vox_free(ctx);
-        return NULL;
-    }
+        if (vqf_load_encoder(&ctx->encoder, vf) != 0) {
+            fprintf(stderr, "vox_load: failed to load encoder from VQF\n");
+            vox_free(ctx);
+            return NULL;
+        }
 
-    if (vox_adapter_load(&ctx->adapter, sf) != 0) {
-        fprintf(stderr, "vox_load: failed to load adapter\n");
-        vox_free(ctx);
-        return NULL;
-    }
+        if (vqf_load_adapter(&ctx->adapter, vf) != 0) {
+            fprintf(stderr, "vox_load: failed to load adapter from VQF\n");
+            vox_free(ctx);
+            return NULL;
+        }
 
-    if (vox_decoder_load(&ctx->decoder, sf) != 0) {
-        fprintf(stderr, "vox_load: failed to load decoder\n");
-        vox_free(ctx);
-        return NULL;
+        if (vqf_load_decoder(&ctx->decoder, vf) != 0) {
+            fprintf(stderr, "vox_load: failed to load decoder from VQF\n");
+            vox_free(ctx);
+            return NULL;
+        }
+    } else {
+        /* ---- Original safetensors path ---- */
+        snprintf(path, sizeof(path), "%s/consolidated.safetensors", model_dir);
+
+        if (vox_verbose >= 2)
+            fprintf(stderr, "Loading model from %s\n", path);
+
+        safetensors_file_t *sf = safetensors_open(path);
+        if (!sf) {
+            fprintf(stderr, "vox_load: cannot open %s\n", path);
+            free(ctx);
+            return NULL;
+        }
+        ctx->safetensors = sf;
+
+        if (vox_verbose >= 1)
+            fprintf(stderr, "Loading weights...\n");
+        if (vox_encoder_load(&ctx->encoder, sf) != 0) {
+            fprintf(stderr, "vox_load: failed to load encoder\n");
+            vox_free(ctx);
+            return NULL;
+        }
+
+        if (vox_adapter_load(&ctx->adapter, sf) != 0) {
+            fprintf(stderr, "vox_load: failed to load adapter\n");
+            vox_free(ctx);
+            return NULL;
+        }
+
+        if (vox_decoder_load(&ctx->decoder, sf) != 0) {
+            fprintf(stderr, "vox_load: failed to load decoder\n");
+            vox_free(ctx);
+            return NULL;
+        }
     }
 
     /* Precompute time conditioning for the decoder (t_cond + per-layer ada_scale). */
     vox_update_time_conditioning(ctx);
+
+#ifdef USE_CUDA
+    /* Upload all quantized weights to GPU (permanently resident) */
+    if (ctx->use_quant && vox_cuda_available()) {
+        vox_cuda_quant_upload_all(ctx);
+    }
+#endif
 
 #ifdef USE_METAL
     /* Pre-warm Metal bf16->f16 weight cache to avoid first-token spike */
@@ -369,6 +410,13 @@ void vox_free(vox_ctx_t *ctx) {
 
     if (ctx->safetensors) {
         safetensors_close((safetensors_file_t *)ctx->safetensors);
+    }
+
+    if (ctx->vqf_file) {
+#ifdef USE_CUDA
+        vox_cuda_quant_free_all();
+#endif
+        vqf_close((vqf_mapped_file_t *)ctx->vqf_file);
     }
 
     free(ctx);
@@ -976,6 +1024,10 @@ static void stream_run_encoder(vox_stream_t *s) {
                                                     actual_overlap_mel);
             }
 #endif
+
+            if (vox_verbose >= 2)
+                fprintf(stderr, "[enc-dbg] stream_run: used_cuda=%d chunk_tokens=%d adapter_chunk=%p\n",
+                        used_cuda, chunk_tokens, (void*)adapter_chunk);
 
             if (!used_cuda) {
                 /* Fallback: CPU encoder + adapter (matmuls may still be CUDA). */
@@ -1942,6 +1994,120 @@ int vox_stream_flush(vox_stream_t *s) {
     stream_run_encoder(s);
     stream_run_decoder(s);
     s->min_new_mel = saved;
+    return 0;
+}
+
+int vox_stream_end_utterance(vox_stream_t *s) {
+    if (!s || s->finished) return -1;
+
+    /* Remember mel_cursor before padding — this tells us how many adapter
+     * tokens the feed phase produced (mel_cursor / (2*VOX_DOWNSAMPLE)). */
+    int mel_before = s->mel_cursor;
+
+    /* Flush: pad silence to push out tokens behind the delay window. */
+    vox_stream_flush(s);
+
+    /* Set finished=1 so encoder processes all remaining mel (the CUDA
+     * chunked encoder skips small chunks when finished=0). */
+    s->finished = 1;
+
+    /* Mel finalization: right-reflect padding (200 samples) + compute
+     * remaining mel frames. */
+    vox_mel_finish(s->mel_ctx, 0);
+
+    /* Run encoder. For short audio, the CUDA chunked encoder will
+     * re-encode from scratch (overlap > mel_cursor), resetting
+     * total_adapter to 0. This is fine — we fix it up below. */
+    stream_run_encoder(s);
+
+    /* The re-encode produced total_adapter tokens for the full mel.
+     * The decoder already consumed tokens for mel_before's worth of audio.
+     * Adjust adapter state so decoder only sees the NEW tokens
+     * (from the mel_finish finalization). */
+    int re_encode_tokens = s->total_adapter; /* total from re-encode (offset=0) */
+    int old_tokens = mel_before / (2 * VOX_DOWNSAMPLE);
+    int new_tokens = re_encode_tokens - old_tokens;
+    if (new_tokens < 0) new_tokens = 0;
+
+    /* Map logical decoder positions to physical adapter entries:
+     * gen_pos → physical old_tokens (first new entry in adapter buffer) */
+    s->adapter_pos_offset = s->gen_pos - old_tokens;
+    s->total_adapter = s->gen_pos + new_tokens;
+#ifdef USE_CUDA
+    /* The CUDA adapter buffer has re_encode_tokens entries at physical 0..N-1
+     * with pos_offset=0 (from the overlap-handler reset). Relabel them to
+     * start at adapter_pos_offset so the decoder accesses the correct
+     * physical entries. relabel() only changes pos_offset without
+     * clobbering logical_len (unlike set_offset()). */
+    if (stream_use_cuda_pipeline_full())
+        vox_cuda_stream_adapter_relabel(s->ctx, s->adapter_pos_offset);
+#endif
+
+    stream_run_decoder(s);
+
+    /* Clear finished + eos_seen so stream can accept more audio.
+     * reset_encoder() will be called before the next feed. */
+    s->finished = 0;
+    s->eos_seen = 0;
+
+    if (vox_verbose >= 2)
+        fprintf(stderr, "[stream] Utterance ended at gen_pos %d (new_tokens=%d)\n",
+                s->gen_pos, new_tokens);
+
+    return 0;
+}
+
+/* Reset encoder pipeline for a new utterance within the same stream.
+ * Clears: encoder KV cache, mel context, conv stem, adapter buffer, CUDA adapter.
+ * Preserves: decoder KV cache, decoder_started, gen_pos, prev_token.
+ * This implements the "split cache trick" for push-to-talk with persistent
+ * decoder context: each PTT push starts a fresh audio encode, but the text
+ * decoder's KV cache retains semantic context from previous utterances. */
+int vox_stream_reset_encoder(vox_stream_t *s) {
+    if (!s) return -1;
+
+    /* Reset encoder KV cache on model context */
+    s->ctx->enc_kv_cache_len = 0;
+    s->ctx->enc_kv_pos_offset = 0;
+
+    /* Reset mel context (free + recreate with 32 left-pad tokens of silence) */
+    vox_mel_free(s->mel_ctx);
+    s->mel_ctx = vox_mel_ctx_init(32 * RAW_AUDIO_LENGTH_PER_TOK);
+    if (!s->mel_ctx) return -1;
+
+    s->real_samples_fed = 0;
+    s->mel_cursor = 0;
+    s->chunk_num = 0;
+
+    /* Reset conv stem state */
+    s->conv_stem_initialized = 0;
+    s->conv0_residual_count = 0;
+    if (s->mel_tail) memset(s->mel_tail, 0, 128 * 2 * sizeof(float));
+    if (s->conv0_tail) memset(s->conv0_tail, 0, 1280 * 2 * sizeof(float));
+    if (s->conv0_residual) memset(s->conv0_residual, 0, 1280 * sizeof(float));
+
+    /* Reset encoder residual positions */
+    s->enc_residual_count = 0;
+
+    /* Reset adapter buffer (decoder will continue from gen_pos) */
+    s->total_adapter = s->gen_pos;  /* align adapter to decoder position */
+    s->adapter_pos_offset = s->gen_pos;
+
+#ifdef USE_CUDA
+    if (stream_use_cuda_pipeline_full()) {
+        vox_cuda_stream_adapter_reset(s->ctx);
+        /* Re-set adapter offset so CUDA path knows where decoder left off */
+        vox_cuda_stream_adapter_set_offset(s->ctx, s->gen_pos);
+    }
+#endif
+
+    /* Clear finished + eos_seen so feeding can resume */
+    s->finished = 0;
+    s->eos_seen = 0;
+
+    if (vox_verbose >= 2)
+        fprintf(stderr, "[stream] Encoder reset (decoder at pos %d, KV retained)\n", s->gen_pos);
+
     return 0;
 }
 

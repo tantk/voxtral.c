@@ -90,6 +90,8 @@ int vox_cuda_encode_adapter(float **out, int *out_tokens,
  * VOX_CUDA_PIPELINE_FULL=1, or disable it with VOX_CUDA_PIPELINE_FULL=0 (or
  * VOX_DISABLE_CUDA_PIPELINE_FULL=1). */
 void vox_cuda_stream_adapter_reset(vox_ctx_t *ctx);
+void vox_cuda_stream_adapter_set_offset(vox_ctx_t *ctx, int offset);
+void vox_cuda_stream_adapter_relabel(vox_ctx_t *ctx, int new_pos_offset);
 
 /* Copy the first `n_tokens` adapter embeddings from the device-side adapter
  * buffer into `out_host` (float32, shape [n_tokens, VOX_DEC_DIM]). Used to

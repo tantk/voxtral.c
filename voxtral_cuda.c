@@ -25,6 +25,8 @@
 #include "voxtral_cuda_kernels_cubin.h"
 #include "voxtral.h"
 #include "voxtral_kernels.h"
+#include "voxtral_cuda_quant.h"
+#include "voxtral_quant.h"
 
 #define VOX_CUDA_ATTN_V3_CHUNK 256
 #define VOX_CUDA_ATTN_V3_CHUNKS ((VOX_DEC_WINDOW + VOX_CUDA_ATTN_V3_CHUNK - 1) / VOX_CUDA_ATTN_V3_CHUNK)
@@ -40,11 +42,11 @@ extern int vox_verbose;
 
 static cublasHandle_t g_handle;
 static cublasLtHandle_t g_lt_handle;
-static CUcontext g_ctx;
-static CUstream g_stream;
+CUcontext g_ctx;
+CUstream g_stream;
 static CUdevice g_dev;
 static int g_init = 0;
-static int g_available = 0;
+int g_available = 0;
 static char g_device_name[256] = "unavailable";
 static int g_cc_major = 0;
 static int g_cc_minor = 0;
@@ -109,7 +111,7 @@ static int g_stream_step_adapter_slot = 0;
 static int g_use_mempool = 0;
 static CUmemoryPool g_mempool = 0;
 
-static CUmodule g_mod = 0;
+CUmodule g_mod = 0;
 static CUfunction g_fn_attn = 0;
 static CUfunction g_fn_attn_fp16 = 0;
 static CUfunction g_fn_attn_f32 = 0;
@@ -1047,6 +1049,7 @@ static int g_dec_graph_use_best_dtoh = 0;
 static int g_dec_graph_use_step_embed_from_adapter = 0;
 /* 0=matmul+argmax, 1=bf16_fused_top1, 2=int8_fused_top1 */
 static int g_dec_graph_logits_mode = 0;
+static int g_dec_graph_use_quant = 0;
 
 static int ensure_buffer(CUdeviceptr *buf, size_t *cap, size_t needed_bytes) {
     if (*cap >= needed_bytes) return 1;
@@ -1149,6 +1152,32 @@ void vox_cuda_stream_adapter_reset(vox_ctx_t *ctx) {
     g_stream_adapter_logical_len = 0;
     g_stream_adapter_pos_offset = 0;
     g_stream_adapter_head = 0;
+    cuda_ctx_state_save_bound();
+    cuda_api_unlock();
+}
+
+void vox_cuda_stream_adapter_set_offset(vox_ctx_t *ctx, int offset) {
+    cuda_api_lock();
+    if (!vox_cuda_available() || !ctx) { cuda_api_unlock(); return; }
+    cuda_ctx_bind(ctx);
+    (void)cuCtxSetCurrent(g_ctx);
+    g_stream_adapter_logical_len = offset;
+    g_stream_adapter_pos_offset = offset;
+    g_stream_adapter_head = 0;
+    cuda_ctx_state_save_bound();
+    cuda_api_unlock();
+}
+
+void vox_cuda_stream_adapter_relabel(vox_ctx_t *ctx, int new_pos_offset) {
+    cuda_api_lock();
+    if (!vox_cuda_available() || !ctx) { cuda_api_unlock(); return; }
+    cuda_ctx_bind(ctx);
+    (void)cuCtxSetCurrent(g_ctx);
+    /* Relabel adapter entries to a new logical base while preserving the
+     * physical entry count: phys = logical_len - pos_offset stays the same. */
+    int phys_entries = g_stream_adapter_logical_len - g_stream_adapter_pos_offset;
+    g_stream_adapter_pos_offset = new_pos_offset;
+    g_stream_adapter_logical_len = new_pos_offset + phys_entries;
     cuda_ctx_state_save_bound();
     cuda_api_unlock();
 }
@@ -3572,6 +3601,7 @@ void vox_cuda_shutdown(void) {
     g_dec_graph_use_best_dtoh = 0;
     g_dec_graph_use_step_embed_from_adapter = 0;
     g_dec_graph_logits_mode = 0;
+    g_dec_graph_use_quant = 0;
     shutdown_dev_free_ptr(&g_dec_pos_dev);
     shutdown_dev_free_ptr(&g_dec_logical_pos_dev);
     shutdown_dev_free_ptr(&g_dec_prev_token_dev);
@@ -4737,6 +4767,140 @@ static int causal_conv1d_out_len(int length, int kernel_size, int stride) {
     return out_len < 0 ? 0 : out_len;
 }
 
+/* ========================================================================
+ * Encoder weight dequant cache: Q4_K/Q8_0/Q4_0 → BF16 (one-time CPU cost)
+ *
+ * On first encoder call, dequantizes each quantized weight to BF16 on CPU,
+ * caches the host buffer, and feeds it to bf16_cache_get() for GPU upload.
+ * Subsequent calls use cached BF16 → cuBLAS GEMM (same speed as safetensors).
+ * ======================================================================== */
+
+typedef struct {
+    const void *quant_key;  /* original quantized pointer (lookup key) */
+    uint16_t *bf16_host;    /* malloc'd BF16 host buffer */
+    size_t numel;           /* number of elements */
+} enc_dequant_entry_t;
+
+static enc_dequant_entry_t *g_enc_dq_cache = NULL;
+static int g_enc_dq_len = 0;
+static int g_enc_dq_cap = 0;
+
+static uint16_t float_to_bf16_trunc(float f) {
+    uint32_t u;
+    memcpy(&u, &f, sizeof(u));
+    return (uint16_t)(u >> 16);
+}
+
+static uint16_t *dequant_to_bf16(const void *W_q, int qtype, int K, int N) {
+    size_t numel = (size_t)N * K;
+    uint16_t *out = (uint16_t *)malloc(numel * sizeof(uint16_t));
+    if (!out) return NULL;
+    const uint8_t *wdata = (const uint8_t *)W_q;
+
+    if (qtype == VQF_TYPE_Q4_K) {
+        int sblocks_per_row = K / VQF_Q4_K_BLOCK_SIZE;
+        size_t row_bytes = (size_t)sblocks_per_row * VQF_Q4_K_BLOCK_BYTES;
+        for (int row = 0; row < N; row++) {
+            const uint8_t *rp = wdata + (size_t)row * row_bytes;
+            uint16_t *dst_row = out + (size_t)row * K;
+            for (int sb = 0; sb < sblocks_per_row; sb++) {
+                const uint8_t *block = rp + (size_t)sb * VQF_Q4_K_BLOCK_BYTES;
+                float super_scale, super_min;
+                memcpy(&super_scale, block, sizeof(float));
+                memcpy(&super_min, block + 4, sizeof(float));
+                const uint8_t *packed = block + 8;
+                const uint8_t *nibs = block + 20;
+                uint8_t q_scales[8], q_mins[8];
+                for (int i = 0; i < 4; i++) {
+                    uint8_t b0 = packed[i * 3], b1 = packed[i * 3 + 1], b2 = packed[i * 3 + 2];
+                    q_scales[i * 2]     = b0 & 0x3F;
+                    q_scales[i * 2 + 1] = ((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2);
+                    q_mins[i * 2]       = ((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4);
+                    q_mins[i * 2 + 1]   = (b2 >> 2) & 0x3F;
+                }
+                int k_base = sb * VQF_Q4_K_BLOCK_SIZE;
+                for (int sub = 0; sub < 8; sub++) {
+                    float s = (float)q_scales[sub] * super_scale;
+                    float m = (float)q_mins[sub] * super_min;
+                    const uint8_t *sub_nibs = nibs + sub * 16;
+                    int sk = k_base + sub * 32;
+                    for (int i = 0; i < 16; i++) {
+                        uint8_t byte = sub_nibs[i];
+                        dst_row[sk + 2 * i]     = float_to_bf16_trunc(s * (float)(byte & 0xF) - m);
+                        dst_row[sk + 2 * i + 1] = float_to_bf16_trunc(s * (float)((byte >> 4) & 0xF) - m);
+                    }
+                }
+            }
+        }
+    } else if (qtype == VQF_TYPE_Q8_0) {
+        int blocks_per_row = K / VQF_Q8_0_BLOCK_SIZE;
+        size_t row_bytes = (size_t)blocks_per_row * VQF_Q8_0_BLOCK_BYTES;
+        for (int row = 0; row < N; row++) {
+            const uint8_t *rp = wdata + (size_t)row * row_bytes;
+            uint16_t *dst_row = out + (size_t)row * K;
+            for (int b = 0; b < blocks_per_row; b++) {
+                const uint8_t *block = rp + (size_t)b * VQF_Q8_0_BLOCK_BYTES;
+                float scale;
+                memcpy(&scale, block, sizeof(float));
+                const int8_t *quants = (const int8_t *)(block + 4);
+                int k_base = b * VQF_Q8_0_BLOCK_SIZE;
+                for (int i = 0; i < VQF_Q8_0_BLOCK_SIZE; i++)
+                    dst_row[k_base + i] = float_to_bf16_trunc(scale * (float)quants[i]);
+            }
+        }
+    } else if (qtype == VQF_TYPE_Q4_0) {
+        int blocks_per_row = K / VQF_Q4_0_BLOCK_SIZE;
+        size_t row_bytes = (size_t)blocks_per_row * VQF_Q4_0_BLOCK_BYTES;
+        for (int row = 0; row < N; row++) {
+            const uint8_t *rp = wdata + (size_t)row * row_bytes;
+            uint16_t *dst_row = out + (size_t)row * K;
+            for (int b = 0; b < blocks_per_row; b++) {
+                const uint8_t *block = rp + (size_t)b * VQF_Q4_0_BLOCK_BYTES;
+                float scale;
+                memcpy(&scale, block, sizeof(float));
+                const uint8_t *nibs_data = block + 4;
+                int k_base = b * VQF_Q4_0_BLOCK_SIZE;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t byte = nibs_data[i];
+                    dst_row[k_base + 2 * i]     = float_to_bf16_trunc(scale * (float)((byte & 0xF) - 8));
+                    dst_row[k_base + 2 * i + 1] = float_to_bf16_trunc(scale * (float)(((byte >> 4) & 0xF) - 8));
+                }
+            }
+        }
+    } else {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
+/* Get or create a cached BF16 dequantization of a quantized weight.
+ * Returns a persistent host BF16 pointer suitable for bf16_cache_get(). */
+static uint16_t *enc_dequant_bf16_get(const void *W_q, int qtype, int K, int N) {
+    if (!W_q) return NULL;
+    /* Check cache */
+    for (int i = 0; i < g_enc_dq_len; i++) {
+        if (g_enc_dq_cache[i].quant_key == W_q)
+            return g_enc_dq_cache[i].bf16_host;
+    }
+    /* Dequant on CPU */
+    uint16_t *bf16 = dequant_to_bf16(W_q, qtype, K, N);
+    if (!bf16) return NULL;
+    /* Cache it */
+    if (g_enc_dq_len >= g_enc_dq_cap) {
+        int new_cap = g_enc_dq_cap ? g_enc_dq_cap * 2 : 256;
+        enc_dequant_entry_t *tmp = (enc_dequant_entry_t *)realloc(
+            g_enc_dq_cache, (size_t)new_cap * sizeof(enc_dequant_entry_t));
+        if (!tmp) { free(bf16); return NULL; }
+        g_enc_dq_cache = tmp;
+        g_enc_dq_cap = new_cap;
+    }
+    g_enc_dq_cache[g_enc_dq_len++] = (enc_dequant_entry_t){
+        .quant_key = W_q, .bf16_host = bf16, .numel = (size_t)N * K
+    };
+    return bf16;
+}
+
 static int vox_cuda_encode_adapter_impl(float **out, int *out_tokens,
                                         vox_ctx_t *ctx,
                                         const float *mel,
@@ -4947,6 +5111,11 @@ static int vox_cuda_encode_adapter_impl(float **out, int *out_tokens,
 
     float attn_scale = 1.0f / sqrtf((float)head_dim);
 
+    int use_quant = ctx->use_quant;
+
+    /* Load quantized CUDA kernels if needed */
+    if (use_quant && !vox_cuda_quant_load_kernels()) return 0;
+
     /* ---- Transformer layers (GPU) ---- */
     for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
         vox_enc_layer_t *l = &enc->layers[layer];
@@ -4959,75 +5128,163 @@ static int vox_cuda_encode_adapter_impl(float **out, int *out_tokens,
         CUdeviceptr d_w2_bias = f32_cache_get(l->w2_bias, (size_t)dim * sizeof(float));
         if (!d_attn_norm || !d_ffn_norm || !d_wq_bias || !d_wv_bias || !d_wo_bias || !d_w2_bias) return 0;
 
-        /* x_norm_bf16 = rms_norm(x) */
-        if (!launch_rms_norm_to_bf16(g_enc_x_bf16, g_enc_x, d_attn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) {
-            if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_attn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
-            if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
+        if (use_quant) {
+            /* === Quantized path: dequant to BF16 + cuBLAS GEMM === */
+            if (layer % 8 == 0 && vox_verbose >= 2)
+                fprintf(stderr, "  Encoder layer %d/%d (quant->bf16)\n", layer+1, VOX_ENC_LAYERS);
+
+            /* Dequant weights to BF16 (cached after first call) */
+            uint16_t *hWq = enc_dequant_bf16_get(l->wq_weight_q, l->wq_qtype, dim, qkv_dim);
+            uint16_t *hWk = enc_dequant_bf16_get(l->wk_weight_q, l->wk_qtype, dim, qkv_dim);
+            uint16_t *hWv = enc_dequant_bf16_get(l->wv_weight_q, l->wv_qtype, dim, qkv_dim);
+            uint16_t *hWo = enc_dequant_bf16_get(l->wo_weight_q, l->wo_qtype, qkv_dim, dim);
+            uint16_t *hW1 = enc_dequant_bf16_get(l->w1_weight_q, l->w1_qtype, dim, hidden);
+            uint16_t *hW3 = enc_dequant_bf16_get(l->w3_weight_q, l->w3_qtype, dim, hidden);
+            uint16_t *hW2 = enc_dequant_bf16_get(l->w2_weight_q, l->w2_qtype, hidden, dim);
+            if (!hWq || !hWk || !hWv || !hWo || !hW1 || !hW3 || !hW2) {
+                fprintf(stderr, "[enc-quant] dequant_bf16 failed layer %d\n", layer);
+                return 0;
+            }
+
+            /* Upload dequanted BF16 to GPU via bf16_cache (cached after first call) */
+            size_t bytes_wq = (size_t)qkv_dim * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_wo = (size_t)dim * (size_t)qkv_dim * sizeof(uint16_t);
+            size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
+
+            CUdeviceptr dWq = bf16_cache_get(hWq, bytes_wq);
+            CUdeviceptr dWk = bf16_cache_get(hWk, bytes_wq);
+            CUdeviceptr dWv = bf16_cache_get(hWv, bytes_wq);
+            if (!dWq || !dWk || !dWv) return 0;
+
+            /* x_norm_bf16 = rms_norm(x) -> BF16 */
+            if (!launch_rms_norm_to_bf16(g_enc_x_bf16, g_enc_x, d_attn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) {
+                if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_attn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
+                if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
+            }
+
+            /* Q,K,V projections via cuBLAS BF16 GEMM */
+            if (!gemm_t_bf16_bf16_f32(g_enc_q, g_enc_x_bf16, dWq, seq_len, dim, qkv_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_k, g_enc_x_bf16, dWk, seq_len, dim, qkv_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_v, g_enc_x_bf16, dWv, seq_len, dim, qkv_dim)) return 0;
+
+            if (!launch_add_bias(g_enc_q, d_wq_bias, seq_len, qkv_dim)) return 0;
+            if (!launch_add_bias(g_enc_v, d_wv_bias, seq_len, qkv_dim)) return 0;
+
+            /* RoPE */
+            if (!launch_apply_rope(g_enc_q, g_enc_rope_freqs, seq_len, n_heads, head_dim)) return 0;
+            if (!launch_apply_rope(g_enc_k, g_enc_rope_freqs, seq_len, n_kv_heads, head_dim)) return 0;
+
+            /* Attention */
+            if (!vox_cuda_causal_attention_dev(g_enc_attn, g_enc_q, g_enc_k, g_enc_v,
+                                               seq_len, seq_len, n_heads, n_kv_heads,
+                                               head_dim, attn_scale, VOX_ENC_WINDOW, 0)) {
+                return 0;
+            }
+
+            /* Output projection */
+            CUdeviceptr dWo = bf16_cache_get(hWo, bytes_wo);
+            if (!dWo) return 0;
+            if (!launch_f32_to_bf16(g_enc_attn_bf16, g_enc_attn, seq_len * qkv_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_proj, g_enc_attn_bf16, dWo, seq_len, qkv_dim, dim)) return 0;
+            if (!launch_add_bias(g_enc_proj, d_wo_bias, seq_len, dim)) return 0;
+            if (!launch_add_inplace(g_enc_x, g_enc_proj, seq_len * dim)) return 0;
+
+            /* FFN */
+            if (!launch_rms_norm_to_bf16(g_enc_x_bf16, g_enc_x, d_ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) {
+                if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
+                if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
+            }
+
+            CUdeviceptr dW1 = bf16_cache_get(hW1, bytes_w1);
+            CUdeviceptr dW3 = bf16_cache_get(hW3, bytes_w1);
+            if (!dW1 || !dW3) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_gate, g_enc_x_bf16, dW1, seq_len, dim, hidden)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_up, g_enc_x_bf16, dW3, seq_len, dim, hidden)) return 0;
+            if (!launch_silu_mul_inplace(g_enc_gate, g_enc_up, seq_len * hidden)) return 0;
+
+            CUdeviceptr dW2 = bf16_cache_get(hW2, bytes_w2);
+            if (!dW2) return 0;
+            if (!launch_f32_to_bf16(g_enc_gate_bf16, g_enc_gate, seq_len * hidden)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_ffn, g_enc_gate_bf16, dW2, seq_len, hidden, dim)) return 0;
+            if (!launch_add_bias(g_enc_ffn, d_w2_bias, seq_len, dim)) return 0;
+            if (!launch_add_inplace(g_enc_x, g_enc_ffn, seq_len * dim)) return 0;
+
+        } else {
+            /* === BF16 path: original cuBLAS GEMM === */
+
+            /* x_norm_bf16 = rms_norm(x) */
+            if (!launch_rms_norm_to_bf16(g_enc_x_bf16, g_enc_x, d_attn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) {
+                if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_attn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
+                if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
+            }
+
+            /* Q,K,V projections */
+            size_t bytes_wq = (size_t)qkv_dim * (size_t)dim * sizeof(uint16_t);
+            CUdeviceptr dWq = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+            CUdeviceptr dWk = bf16_cache_get(l->wk_weight_bf16, bytes_wq);
+            CUdeviceptr dWv = bf16_cache_get(l->wv_weight_bf16, bytes_wq);
+            if (!dWq || !dWk || !dWv) return 0;
+
+            if (!gemm_t_bf16_bf16_f32(g_enc_q, g_enc_x_bf16, dWq, seq_len, dim, qkv_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_k, g_enc_x_bf16, dWk, seq_len, dim, qkv_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_v, g_enc_x_bf16, dWv, seq_len, dim, qkv_dim)) return 0;
+
+            if (!launch_add_bias(g_enc_q, d_wq_bias, seq_len, qkv_dim)) return 0;
+            if (!launch_add_bias(g_enc_v, d_wv_bias, seq_len, qkv_dim)) return 0;
+
+            /* RoPE */
+            if (!launch_apply_rope(g_enc_q, g_enc_rope_freqs, seq_len, n_heads, head_dim)) return 0;
+            if (!launch_apply_rope(g_enc_k, g_enc_rope_freqs, seq_len, n_kv_heads, head_dim)) return 0;
+
+            /* Attention */
+            if (!vox_cuda_causal_attention_dev(g_enc_attn, g_enc_q, g_enc_k, g_enc_v,
+                                               seq_len, seq_len, n_heads, n_kv_heads,
+                                               head_dim, attn_scale, VOX_ENC_WINDOW, 0)) {
+                return 0;
+            }
+
+            /* Output projection */
+            size_t bytes_wo = (size_t)dim * (size_t)qkv_dim * sizeof(uint16_t);
+            CUdeviceptr dWo = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+            if (!dWo) return 0;
+
+            if (!launch_f32_to_bf16(g_enc_attn_bf16, g_enc_attn, seq_len * qkv_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_proj, g_enc_attn_bf16, dWo, seq_len, qkv_dim, dim)) return 0;
+            if (!launch_add_bias(g_enc_proj, d_wo_bias, seq_len, dim)) return 0;
+            if (!launch_add_inplace(g_enc_x, g_enc_proj, seq_len * dim)) return 0;
+
+            /* FFN */
+            if (!launch_rms_norm_to_bf16(g_enc_x_bf16, g_enc_x, d_ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) {
+                if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
+                if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
+            }
+
+            size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
+            CUdeviceptr dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+            CUdeviceptr dW3 = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+            if (!dW1 || !dW3) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_gate, g_enc_x_bf16, dW1, seq_len, dim, hidden)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_up, g_enc_x_bf16, dW3, seq_len, dim, hidden)) return 0;
+            if (!launch_silu_mul_inplace(g_enc_gate, g_enc_up, seq_len * hidden)) return 0;
+
+            size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
+            CUdeviceptr dW2 = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+            if (!dW2) return 0;
+
+            if (!launch_f32_to_bf16(g_enc_gate_bf16, g_enc_gate, seq_len * hidden)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_enc_ffn, g_enc_gate_bf16, dW2, seq_len, hidden, dim)) return 0;
+            if (!launch_add_bias(g_enc_ffn, d_w2_bias, seq_len, dim)) return 0;
+            if (!launch_add_inplace(g_enc_x, g_enc_ffn, seq_len * dim)) return 0;
         }
-
-        /* Q,K,V projections */
-        size_t bytes_wq = (size_t)qkv_dim * (size_t)dim * sizeof(uint16_t);
-        CUdeviceptr dWq = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
-        CUdeviceptr dWk = bf16_cache_get(l->wk_weight_bf16, bytes_wq);
-        CUdeviceptr dWv = bf16_cache_get(l->wv_weight_bf16, bytes_wq);
-        if (!dWq || !dWk || !dWv) return 0;
-
-        if (!gemm_t_bf16_bf16_f32(g_enc_q, g_enc_x_bf16, dWq, seq_len, dim, qkv_dim)) return 0;
-        if (!gemm_t_bf16_bf16_f32(g_enc_k, g_enc_x_bf16, dWk, seq_len, dim, qkv_dim)) return 0;
-        if (!gemm_t_bf16_bf16_f32(g_enc_v, g_enc_x_bf16, dWv, seq_len, dim, qkv_dim)) return 0;
-
-        if (!launch_add_bias(g_enc_q, d_wq_bias, seq_len, qkv_dim)) return 0;
-        if (!launch_add_bias(g_enc_v, d_wv_bias, seq_len, qkv_dim)) return 0;
-
-        /* RoPE */
-        if (!launch_apply_rope(g_enc_q, g_enc_rope_freqs, seq_len, n_heads, head_dim)) return 0;
-        if (!launch_apply_rope(g_enc_k, g_enc_rope_freqs, seq_len, n_kv_heads, head_dim)) return 0;
-
-        /* Attention */
-        if (!vox_cuda_causal_attention_dev(g_enc_attn, g_enc_q, g_enc_k, g_enc_v,
-                                           seq_len, seq_len, n_heads, n_kv_heads,
-                                           head_dim, attn_scale, VOX_ENC_WINDOW, 0)) {
-            return 0;
-        }
-
-        /* Output projection */
-        size_t bytes_wo = (size_t)dim * (size_t)qkv_dim * sizeof(uint16_t);
-        CUdeviceptr dWo = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
-        if (!dWo) return 0;
-
-        if (!launch_f32_to_bf16(g_enc_attn_bf16, g_enc_attn, seq_len * qkv_dim)) return 0;
-        if (!gemm_t_bf16_bf16_f32(g_enc_proj, g_enc_attn_bf16, dWo, seq_len, qkv_dim, dim)) return 0;
-        if (!launch_add_bias(g_enc_proj, d_wo_bias, seq_len, dim)) return 0;
-        if (!launch_add_inplace(g_enc_x, g_enc_proj, seq_len * dim)) return 0;
-
-        /* FFN */
-        if (!launch_rms_norm_to_bf16(g_enc_x_bf16, g_enc_x, d_ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) {
-            if (!launch_rms_norm(g_enc_x_norm, g_enc_x, d_ffn_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
-            if (!launch_f32_to_bf16(g_enc_x_bf16, g_enc_x_norm, seq_len * dim)) return 0;
-        }
-
-        size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
-        CUdeviceptr dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
-        CUdeviceptr dW3 = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
-        if (!dW1 || !dW3) return 0;
-        if (!gemm_t_bf16_bf16_f32(g_enc_gate, g_enc_x_bf16, dW1, seq_len, dim, hidden)) return 0;
-        if (!gemm_t_bf16_bf16_f32(g_enc_up, g_enc_x_bf16, dW3, seq_len, dim, hidden)) return 0;
-        if (!launch_silu_mul_inplace(g_enc_gate, g_enc_up, seq_len * hidden)) return 0;
-
-        size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
-        CUdeviceptr dW2 = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
-        if (!dW2) return 0;
-
-        if (!launch_f32_to_bf16(g_enc_gate_bf16, g_enc_gate, seq_len * hidden)) return 0;
-        if (!gemm_t_bf16_bf16_f32(g_enc_ffn, g_enc_gate_bf16, dW2, seq_len, hidden, dim)) return 0;
-        if (!launch_add_bias(g_enc_ffn, d_w2_bias, seq_len, dim)) return 0;
-        if (!launch_add_inplace(g_enc_x, g_enc_ffn, seq_len * dim)) return 0;
     }
 
     /* Final norm (in-place) */
     CUdeviceptr d_norm = f32_cache_get(enc->norm, (size_t)dim * sizeof(float));
-    if (!d_norm) return 0;
-    if (!launch_rms_norm(g_enc_x, g_enc_x, d_norm, seq_len, dim, VOX_ENC_NORM_EPS)) return 0;
+    if (!d_norm) { fprintf(stderr, "[enc-dbg] final norm f32_cache_get failed\n"); return 0; }
+    if (!launch_rms_norm(g_enc_x, g_enc_x, d_norm, seq_len, dim, VOX_ENC_NORM_EPS)) { fprintf(stderr, "[enc-dbg] final rms_norm failed\n"); return 0; }
+
+    if (vox_verbose >= 2) fprintf(stderr, "[enc-dbg] encoder layers done, starting adapter (ds_len=%d)\n", ds_len);
 
     /* ---- Adapter (GPU) ---- */
     int ds_dim = dim * 4; /* 5120 */
@@ -5041,23 +5298,24 @@ static int vox_cuda_encode_adapter_impl(float **out, int *out_tokens,
         !ensure_buffer(&g_enc_mid, &g_cap_enc_mid, bytes_mid) ||
         !ensure_buffer(&g_enc_mid_bf16, &g_cap_enc_mid_bf16, bytes_mid_bf16) ||
         !ensure_buffer(&g_enc_adapter, &g_cap_enc_adapter, bytes_mid)) {
+        fprintf(stderr, "[enc-dbg] adapter ensure_buffer failed\n");
         return 0;
     }
 
-    if (!launch_downsample4_concat(g_enc_ds, g_enc_x, overlap_enc, new_enc_len, dim)) return 0;
+    if (!launch_downsample4_concat(g_enc_ds, g_enc_x, overlap_enc, new_enc_len, dim)) { fprintf(stderr, "[enc-dbg] downsample4 failed\n"); return 0; }
 
     size_t bytes_w0 = (size_t)VOX_DEC_DIM * (size_t)ds_dim * sizeof(uint16_t);
     CUdeviceptr dW0 = bf16_cache_get(ctx->adapter.linear0_weight_bf16, bytes_w0);
-    if (!dW0) return 0;
-    if (!launch_f32_to_bf16(g_enc_ds_bf16, g_enc_ds, ds_len * ds_dim)) return 0;
-    if (!gemm_t_bf16_bf16_f32(g_enc_mid, g_enc_ds_bf16, dW0, ds_len, ds_dim, VOX_DEC_DIM)) return 0;
-    if (!launch_gelu_inplace(g_enc_mid, ds_len * VOX_DEC_DIM)) return 0;
+    if (!dW0) { fprintf(stderr, "[enc-dbg] adapter linear0 bf16_cache_get failed (host=%p, bytes=%zu)\n", (void*)ctx->adapter.linear0_weight_bf16, bytes_w0); return 0; }
+    if (!launch_f32_to_bf16(g_enc_ds_bf16, g_enc_ds, ds_len * ds_dim)) { fprintf(stderr, "[enc-dbg] f32_to_bf16(ds) failed\n"); return 0; }
+    if (!gemm_t_bf16_bf16_f32(g_enc_mid, g_enc_ds_bf16, dW0, ds_len, ds_dim, VOX_DEC_DIM)) { fprintf(stderr, "[enc-dbg] gemm(linear0) failed\n"); return 0; }
+    if (!launch_gelu_inplace(g_enc_mid, ds_len * VOX_DEC_DIM)) { fprintf(stderr, "[enc-dbg] gelu failed\n"); return 0; }
 
     size_t bytes_w1 = (size_t)VOX_DEC_DIM * (size_t)VOX_DEC_DIM * sizeof(uint16_t);
     CUdeviceptr dW1 = bf16_cache_get(ctx->adapter.linear1_weight_bf16, bytes_w1);
-    if (!dW1) return 0;
-    if (!launch_f32_to_bf16(g_enc_mid_bf16, g_enc_mid, ds_len * VOX_DEC_DIM)) return 0;
-    if (!gemm_t_bf16_bf16_f32(g_enc_adapter, g_enc_mid_bf16, dW1, ds_len, VOX_DEC_DIM, VOX_DEC_DIM)) return 0;
+    if (!dW1) { fprintf(stderr, "[enc-dbg] adapter linear1 bf16_cache_get failed (host=%p, bytes=%zu)\n", (void*)ctx->adapter.linear1_weight_bf16, bytes_w1); return 0; }
+    if (!launch_f32_to_bf16(g_enc_mid_bf16, g_enc_mid, ds_len * VOX_DEC_DIM)) { fprintf(stderr, "[enc-dbg] f32_to_bf16(mid) failed\n"); return 0; }
+    if (!gemm_t_bf16_bf16_f32(g_enc_adapter, g_enc_mid_bf16, dW1, ds_len, VOX_DEC_DIM, VOX_DEC_DIM)) { fprintf(stderr, "[enc-dbg] gemm(linear1) failed\n"); return 0; }
 
     /* Optional: full CUDA streaming pipeline keeps adapter output on device and
      * appends it to a device-side buffer (avoids a large DtoH copy). */
@@ -5142,6 +5400,9 @@ static int vox_cuda_encode_adapter_stream_append_impl(int *out_tokens,
     float *host_out = NULL;
     int tokens = 0;
     int ok = vox_cuda_encode_adapter(&host_out, &tokens, ctx, mel, mel_frames, overlap_mel);
+    if (vox_verbose >= 2)
+        fprintf(stderr, "[enc-dbg] stream_append: encode_adapter returned ok=%d tokens=%d host_out=%p\n",
+                ok, tokens, (void*)host_out);
     if (!ok) { free(host_out); return 0; }
 
     /* In VOX_CUDA_PIPELINE_FULL mode, vox_cuda_encode_adapter should have already
@@ -5237,6 +5498,7 @@ static void decoder_graph_destroy(void) {
     g_dec_graph_use_best_dtoh = 0;
     g_dec_graph_use_step_embed_from_adapter = 0;
     g_dec_graph_logits_mode = 0;
+    g_dec_graph_use_quant = 0;
 
     if (g_dec_pos_dev) cuMemFree(g_dec_pos_dev);
     g_dec_pos_dev = 0;
@@ -5282,9 +5544,13 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
     int hidden = VOX_DEC_HIDDEN;
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
-    int use_merge_qkv = merge_qkv_enabled();
-    int use_merge_ffn13 = merge_ffn13_enabled();
+    int use_quant = ctx->use_quant;
+    int use_merge_qkv = use_quant ? 0 : merge_qkv_enabled();
+    int use_merge_ffn13 = use_quant ? 0 : merge_ffn13_enabled();
     int use_rope_dev = (rope_dev_enabled() && g_fn_rope_freqs_1pos);
+
+    /* Load quantized CUDA kernels if needed */
+    if (use_quant && !vox_cuda_quant_load_kernels()) return 0;
 
     /* Ensure device KV cache is ready and large enough. */
     int want_max_seq = ctx->kv_cache_max > 0 ? ctx->kv_cache_max : (VOX_DEC_WINDOW + 2048);
@@ -5357,8 +5623,9 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
         }
     }
 
-    /* Warm up cuBLASLt algo cache + workspace so capture doesn't allocate. */
-    if (g_lt_handle) {
+    /* Warm up cuBLASLt algo cache + workspace so capture doesn't allocate.
+     * Skip for quantized path (no cuBLAS GEMMs for linear layers). */
+    if (!use_quant && g_lt_handle) {
         typedef struct { int M, K, N; } lt_shape_t;
         lt_shape_t shapes[8];
         int n_shapes = 0;
@@ -5403,59 +5670,73 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
     CUdeviceptr tune_W20 = 0;
     for (int layer = 0; layer < VOX_DEC_LAYERS; layer++) {
         vox_dec_layer_t *l = &dec->layers[layer];
-        size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
-        size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
-        size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
-        size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
-        size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
-        if (use_merge_qkv) {
-            CUdeviceptr d = bf16_cache_get_merged_3(l->wq_weight_bf16,
-                                                    l->wq_weight_bf16, bytes_wq,
-                                                    l->wk_weight_bf16, bytes_wkv,
-                                                    l->wv_weight_bf16, bytes_wkv);
-            if (!d) {
-                return 0;
-            }
-            if (layer == 0) tune_Wqkv0 = d;
+
+        if (use_quant) {
+            /* Quantized path: verify all quantized weights are uploaded to GPU */
+            if (!vox_cuda_quant_weight_get(l->wq_weight_q)) return 0;
+            if (!vox_cuda_quant_weight_get(l->wk_weight_q)) return 0;
+            if (!vox_cuda_quant_weight_get(l->wv_weight_q)) return 0;
+            if (!vox_cuda_quant_weight_get(l->wo_weight_q)) return 0;
+            if (!vox_cuda_quant_weight_get(l->w1_weight_q)) return 0;
+            if (!vox_cuda_quant_weight_get(l->w2_weight_q)) return 0;
+            if (!vox_cuda_quant_weight_get(l->w3_weight_q)) return 0;
         } else {
-            CUdeviceptr d;
-            d = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
-            if (!d) return 0;
-            if (layer == 0) tune_Wq0 = d;
-            d = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
-            if (!d) return 0;
-            if (layer == 0) tune_Wk0 = d;
-            d = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
-            if (!d) return 0;
-            if (layer == 0) tune_Wv0 = d;
-        }
-        {
-            CUdeviceptr d = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
-            if (!d) return 0;
-            if (layer == 0) tune_Wo0 = d;
-        }
-        if (use_merge_ffn13) {
-            CUdeviceptr d = bf16_cache_get_merged_2(l->w1_weight_bf16,
-                                                    l->w1_weight_bf16, bytes_w1,
-                                                    l->w3_weight_bf16, bytes_w1);
-            if (!d) {
-                return 0;
+            /* BF16 path: warm BF16 weight caches */
+            size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
+            size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
+            if (use_merge_qkv) {
+                CUdeviceptr d = bf16_cache_get_merged_3(l->wq_weight_bf16,
+                                                        l->wq_weight_bf16, bytes_wq,
+                                                        l->wk_weight_bf16, bytes_wkv,
+                                                        l->wv_weight_bf16, bytes_wkv);
+                if (!d) {
+                    return 0;
+                }
+                if (layer == 0) tune_Wqkv0 = d;
+            } else {
+                CUdeviceptr d;
+                d = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+                if (!d) return 0;
+                if (layer == 0) tune_Wq0 = d;
+                d = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
+                if (!d) return 0;
+                if (layer == 0) tune_Wk0 = d;
+                d = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+                if (!d) return 0;
+                if (layer == 0) tune_Wv0 = d;
             }
-            if (layer == 0) tune_W130 = d;
-        } else {
-            CUdeviceptr d;
-            d = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
-            if (!d) return 0;
-            if (layer == 0) tune_W10 = d;
-            d = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
-            if (!d) return 0;
-        }
-        {
-            CUdeviceptr d = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
-            if (!d) return 0;
-            if (layer == 0) tune_W20 = d;
+            {
+                CUdeviceptr d = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+                if (!d) return 0;
+                if (layer == 0) tune_Wo0 = d;
+            }
+            if (use_merge_ffn13) {
+                CUdeviceptr d = bf16_cache_get_merged_2(l->w1_weight_bf16,
+                                                        l->w1_weight_bf16, bytes_w1,
+                                                        l->w3_weight_bf16, bytes_w1);
+                if (!d) {
+                    return 0;
+                }
+                if (layer == 0) tune_W130 = d;
+            } else {
+                CUdeviceptr d;
+                d = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+                if (!d) return 0;
+                if (layer == 0) tune_W10 = d;
+                d = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+                if (!d) return 0;
+            }
+            {
+                CUdeviceptr d = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+                if (!d) return 0;
+                if (layer == 0) tune_W20 = d;
+            }
         }
 
+        /* Both paths need norms and ada_scale on device */
         if (!f32_cache_get(l->attention_norm, (size_t)dim * sizeof(float))) return 0;
         if (!f32_cache_get(l->ffn_norm, (size_t)dim * sizeof(float))) return 0;
         if (ctx->ada_scale) {
@@ -5475,8 +5756,9 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
     }
 
     /* Autotune cuBLASLt algos now (before capture), so the captured graph only
-     * observes cached algos + a stable workspace pointer. */
-    if (g_lt_handle && cublaslt_autotune_enabled()) {
+     * observes cached algos + a stable workspace pointer.
+     * Skip for quantized path (no cuBLAS GEMMs for linear layers). */
+    if (!use_quant && g_lt_handle && cublaslt_autotune_enabled()) {
         int qkv_dim = q_dim + 2 * kv_dim;
         if (use_merge_qkv && tune_Wqkv0) {
             (void)lt_autotune_t_bf16(1, dim, qkv_dim, g_dec_x_bf16, tune_Wqkv0);
@@ -5506,7 +5788,7 @@ static int decoder_graph_prepare(vox_ctx_t *ctx, int logits_mode) {
         }
     }
 
-    if (g_bf16_evictions != ev_before) return 0;
+    if (!use_quant && g_bf16_evictions != ev_before) return 0;
     return 1;
 }
 
@@ -5543,9 +5825,13 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
     int hidden = VOX_DEC_HIDDEN;
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
-    int use_merge_qkv = merge_qkv_enabled();
-    int use_merge_ffn13 = merge_ffn13_enabled();
+    int use_quant = ctx->use_quant;
+    int use_merge_qkv = use_quant ? 0 : merge_qkv_enabled();
+    int use_merge_ffn13 = use_quant ? 0 : merge_ffn13_enabled();
     int use_rope_dev = (rope_dev_enabled() && g_fn_rope_freqs_1pos && g_dec_logical_pos_dev && g_dec_rope_inv_freq);
+
+    /* Load quantized CUDA kernels if needed */
+    if (use_quant && !vox_cuda_quant_load_kernels()) return 0;
 
     vox_decoder_t *dec = &ctx->decoder;
 
@@ -5561,6 +5847,13 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
     CUdeviceptr dW3[VOX_DEC_LAYERS];
     CUdeviceptr dW2[VOX_DEC_LAYERS];
     CUdeviceptr dAda[VOX_DEC_LAYERS];
+    /* Quantized weight device pointers (parallel arrays, only used when use_quant) */
+    CUdeviceptr dWq_q[VOX_DEC_LAYERS], dWk_q[VOX_DEC_LAYERS], dWv_q[VOX_DEC_LAYERS];
+    CUdeviceptr dWo_q[VOX_DEC_LAYERS];
+    CUdeviceptr dW1_q[VOX_DEC_LAYERS], dW2_q[VOX_DEC_LAYERS], dW3_q[VOX_DEC_LAYERS];
+    int wq_qtype[VOX_DEC_LAYERS], wk_qtype[VOX_DEC_LAYERS], wv_qtype[VOX_DEC_LAYERS];
+    int wo_qtype[VOX_DEC_LAYERS];
+    int w1_qtype[VOX_DEC_LAYERS], w2_qtype[VOX_DEC_LAYERS], w3_qtype[VOX_DEC_LAYERS];
     memset(dWqkv, 0, sizeof(dWqkv));
     memset(dW13, 0, sizeof(dW13));
     memset(dAda, 0, sizeof(dAda));
@@ -5572,36 +5865,56 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
         d_ffn_norm[layer] = f32_cache_get(l->ffn_norm, (size_t)dim * sizeof(float));
         if (!d_attn_norm[layer] || !d_ffn_norm[layer]) return 0;
 
-        size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
-        size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
-        size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
-        size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
-        size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
-        if (use_merge_qkv) {
-            dWqkv[layer] = bf16_cache_get_merged_3(l->wq_weight_bf16,
-                                                   l->wq_weight_bf16, bytes_wq,
-                                                   l->wk_weight_bf16, bytes_wkv,
-                                                   l->wv_weight_bf16, bytes_wkv);
-            if (!dWqkv[layer]) return 0;
+        if (use_quant) {
+            /* Resolve quantized weight device pointers (already uploaded) */
+            dWq_q[layer] = vox_cuda_quant_weight_get(l->wq_weight_q);
+            dWk_q[layer] = vox_cuda_quant_weight_get(l->wk_weight_q);
+            dWv_q[layer] = vox_cuda_quant_weight_get(l->wv_weight_q);
+            dWo_q[layer] = vox_cuda_quant_weight_get(l->wo_weight_q);
+            dW1_q[layer] = vox_cuda_quant_weight_get(l->w1_weight_q);
+            dW2_q[layer] = vox_cuda_quant_weight_get(l->w2_weight_q);
+            dW3_q[layer] = vox_cuda_quant_weight_get(l->w3_weight_q);
+            if (!dWq_q[layer] || !dWk_q[layer] || !dWv_q[layer] || !dWo_q[layer] ||
+                !dW1_q[layer] || !dW2_q[layer] || !dW3_q[layer]) return 0;
+            wq_qtype[layer] = l->wq_qtype;
+            wk_qtype[layer] = l->wk_qtype;
+            wv_qtype[layer] = l->wv_qtype;
+            wo_qtype[layer] = l->wo_qtype;
+            w1_qtype[layer] = l->w1_qtype;
+            w2_qtype[layer] = l->w2_qtype;
+            w3_qtype[layer] = l->w3_qtype;
         } else {
-            dWq[layer] = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
-            dWk[layer] = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
-            dWv[layer] = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
-            if (!dWq[layer] || !dWk[layer] || !dWv[layer]) return 0;
+            size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
+            size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
+            if (use_merge_qkv) {
+                dWqkv[layer] = bf16_cache_get_merged_3(l->wq_weight_bf16,
+                                                       l->wq_weight_bf16, bytes_wq,
+                                                       l->wk_weight_bf16, bytes_wkv,
+                                                       l->wv_weight_bf16, bytes_wkv);
+                if (!dWqkv[layer]) return 0;
+            } else {
+                dWq[layer] = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+                dWk[layer] = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
+                dWv[layer] = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+                if (!dWq[layer] || !dWk[layer] || !dWv[layer]) return 0;
+            }
+            dWo[layer] = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+            if (use_merge_ffn13) {
+                dW13[layer] = bf16_cache_get_merged_2(l->w1_weight_bf16,
+                                                      l->w1_weight_bf16, bytes_w1,
+                                                      l->w3_weight_bf16, bytes_w1);
+                if (!dW13[layer]) return 0;
+            } else {
+                dW1[layer] = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+                dW3[layer] = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+                if (!dW1[layer] || !dW3[layer]) return 0;
+            }
+            dW2[layer] = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+            if (!dWo[layer] || !dW2[layer]) return 0;
         }
-        dWo[layer] = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
-        if (use_merge_ffn13) {
-            dW13[layer] = bf16_cache_get_merged_2(l->w1_weight_bf16,
-                                                  l->w1_weight_bf16, bytes_w1,
-                                                  l->w3_weight_bf16, bytes_w1);
-            if (!dW13[layer]) return 0;
-        } else {
-            dW1[layer] = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
-            dW3[layer] = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
-            if (!dW1[layer] || !dW3[layer]) return 0;
-        }
-        dW2[layer] = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
-        if (!dWo[layer] || !dW2[layer]) return 0;
 
         if (ctx->ada_scale) {
             const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
@@ -5748,33 +6061,38 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
         CUdeviceptr k_base = g_k_cache + (size_t)layer * layer_stride;
         CUdeviceptr v_base = g_v_cache + (size_t)layer * layer_stride;
 
-        /* Attention norm */
-        if (!launch_rms_norm_to_bf16(g_dec_x_bf16, g_dec_x, d_attn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) {
+        CUdeviceptr dQ = g_dec_q, dK = g_dec_k, dV = g_dec_v;
+
+        if (use_quant) {
+            /* === Quantized path: RMS norm to F32, GEMV for Q,K,V === */
             if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) goto capture_fail;
-            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) goto capture_fail;
-        }
-
-        /* Q,K,V projections */
-        CUdeviceptr dQ = 0, dK = 0, dV = 0;
-        if (use_merge_qkv) {
-            int qkv_dim = q_dim + 2 * kv_dim;
-            if (!gemm_t_bf16_bf16_f32(g_dec_qkv, g_dec_x_bf16, dWqkv[layer], 1, dim, qkv_dim)) goto capture_fail;
-            dQ = g_dec_qkv;
-            dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
-            dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
+            if (!vox_cuda_quant_gemv_dev(dQ, g_dec_x_norm, dWq_q[layer], dim, q_dim, wq_qtype[layer])) goto capture_fail;
+            if (!vox_cuda_quant_gemv_dev(dK, g_dec_x_norm, dWk_q[layer], dim, kv_dim, wk_qtype[layer])) goto capture_fail;
+            if (!vox_cuda_quant_gemv_dev(dV, g_dec_x_norm, dWv_q[layer], dim, kv_dim, wv_qtype[layer])) goto capture_fail;
         } else {
-            dQ = g_dec_q;
-            dK = g_dec_k;
-            dV = g_dec_v;
-            if (!gemm_t_bf16_bf16_f32(dQ, g_dec_x_bf16, dWq[layer], 1, dim, q_dim)) goto capture_fail;
-            if (!gemm_t_bf16_bf16_f32(dK, g_dec_x_bf16, dWk[layer], 1, dim, kv_dim)) goto capture_fail;
-            if (!gemm_t_bf16_bf16_f32(dV, g_dec_x_bf16, dWv[layer], 1, dim, kv_dim)) goto capture_fail;
+            /* === BF16 path: RMS norm to BF16, cuBLAS GEMM === */
+            if (!launch_rms_norm_to_bf16(g_dec_x_bf16, g_dec_x, d_attn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) {
+                if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) goto capture_fail;
+                if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) goto capture_fail;
+            }
+            if (use_merge_qkv) {
+                int qkv_dim = q_dim + 2 * kv_dim;
+                if (!gemm_t_bf16_bf16_f32(g_dec_qkv, g_dec_x_bf16, dWqkv[layer], 1, dim, qkv_dim)) goto capture_fail;
+                dQ = g_dec_qkv;
+                dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
+                dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
+            } else {
+                if (!gemm_t_bf16_bf16_f32(dQ, g_dec_x_bf16, dWq[layer], 1, dim, q_dim)) goto capture_fail;
+                if (!gemm_t_bf16_bf16_f32(dK, g_dec_x_bf16, dWk[layer], 1, dim, kv_dim)) goto capture_fail;
+                if (!gemm_t_bf16_bf16_f32(dV, g_dec_x_bf16, dWv[layer], 1, dim, kv_dim)) goto capture_fail;
+            }
         }
 
-        /* RoPE */
+        /* RoPE (shared — both paths produce F32 Q,K) */
         if (!launch_apply_rope(dQ, g_dec_rope_freqs, 1, n_heads, head_dim)) goto capture_fail;
         if (!launch_apply_rope(dK, g_dec_rope_freqs, 1, n_kv_heads, head_dim)) goto capture_fail;
 
+        /* KV append + attention (shared) */
         if (want_fp16 && use_v6) {
             void *p_params[] = { &g_dAttnV3_part, &g_dAttnV3_max, &g_dAttnV3_sum,
                                  &dQ, &k_base, &v_base, &dK, &dV, &g_dec_pos_dev,
@@ -5875,42 +6193,66 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
             }
         }
 
-        /* Output projection + residual */
-        if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, q_dim)) goto capture_fail;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo[layer], 1, q_dim, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo[layer], 1, q_dim, dim)) goto capture_fail;
-            if (!launch_add_inplace(g_dec_x, g_dec_proj, dim)) goto capture_fail;
-        }
+        if (use_quant) {
+            /* === Quantized path: output projection, FFN === */
 
-        /* FFN */
-        if (dAda[layer] && launch_rms_norm_to_bf16_ada(g_dec_x_bf16, g_dec_x, d_ffn_norm[layer], dAda[layer],
-                                                       1, dim, VOX_DEC_NORM_EPS)) {
-            /* Fused ffn-norm + ada + bf16 cast. */
-        } else {
+            /* Output projection + residual via quantized GEMV with beta=1.0 */
+            if (!vox_cuda_quant_gemv_beta_dev(g_dec_x, g_dec_attn, dWo_q[layer], q_dim, dim, wo_qtype[layer], 1.0f)) goto capture_fail;
+
+            /* FFN norm -> F32 + ada scale (no BF16 conversion) */
             if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) goto capture_fail;
             if (dAda[layer]) {
                 if (!launch_mul_1p_inplace(g_dec_x_norm, dAda[layer], dim)) goto capture_fail;
             }
-            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) goto capture_fail;
-        }
 
-        CUdeviceptr dGate = g_dec_gate;
-        if (use_merge_ffn13) {
-            int n13 = 2 * hidden;
-            if (!gemm_t_bf16_bf16_f32(g_dec_ffn13, g_dec_x_bf16, dW13[layer], 1, dim, n13)) goto capture_fail;
-            dGate = g_dec_ffn13;
-            CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
-            if (!launch_silu_mul_inplace(dGate, dUp, hidden)) goto capture_fail;
-        } else {
-            if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1[layer], 1, dim, hidden)) goto capture_fail;
-            if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3[layer], 1, dim, hidden)) goto capture_fail;
+            /* W1 (gate) and W3 (up) via quantized GEMV */
+            if (!vox_cuda_quant_gemv_dev(g_dec_gate, g_dec_x_norm, dW1_q[layer], dim, hidden, w1_qtype[layer])) goto capture_fail;
+            if (!vox_cuda_quant_gemv_dev(g_dec_up, g_dec_x_norm, dW3_q[layer], dim, hidden, w3_qtype[layer])) goto capture_fail;
             if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) goto capture_fail;
-        }
 
-        if (!launch_f32_to_bf16(g_dec_gate_bf16, dGate, hidden)) goto capture_fail;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2[layer], 1, hidden, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2[layer], 1, hidden, dim)) goto capture_fail;
-            if (!launch_add_inplace(g_dec_x, g_dec_ffn, dim)) goto capture_fail;
+            /* W2 (down) + residual via quantized GEMV with beta=1.0 */
+            if (!vox_cuda_quant_gemv_beta_dev(g_dec_x, g_dec_gate, dW2_q[layer], hidden, dim, w2_qtype[layer], 1.0f)) goto capture_fail;
+
+        } else {
+            /* === BF16 path: output projection, FFN === */
+
+            /* Output projection + residual */
+            if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, q_dim)) goto capture_fail;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo[layer], 1, q_dim, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo[layer], 1, q_dim, dim)) goto capture_fail;
+                if (!launch_add_inplace(g_dec_x, g_dec_proj, dim)) goto capture_fail;
+            }
+
+            /* FFN */
+            if (dAda[layer] && launch_rms_norm_to_bf16_ada(g_dec_x_bf16, g_dec_x, d_ffn_norm[layer], dAda[layer],
+                                                           1, dim, VOX_DEC_NORM_EPS)) {
+                /* Fused ffn-norm + ada + bf16 cast. */
+            } else {
+                if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm[layer], 1, dim, VOX_DEC_NORM_EPS)) goto capture_fail;
+                if (dAda[layer]) {
+                    if (!launch_mul_1p_inplace(g_dec_x_norm, dAda[layer], dim)) goto capture_fail;
+                }
+                if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) goto capture_fail;
+            }
+
+            CUdeviceptr dGate = g_dec_gate;
+            if (use_merge_ffn13) {
+                int n13 = 2 * hidden;
+                if (!gemm_t_bf16_bf16_f32(g_dec_ffn13, g_dec_x_bf16, dW13[layer], 1, dim, n13)) goto capture_fail;
+                dGate = g_dec_ffn13;
+                CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
+                if (!launch_silu_mul_inplace(dGate, dUp, hidden)) goto capture_fail;
+            } else {
+                if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1[layer], 1, dim, hidden)) goto capture_fail;
+                if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3[layer], 1, dim, hidden)) goto capture_fail;
+                if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) goto capture_fail;
+            }
+
+            if (!launch_f32_to_bf16(g_dec_gate_bf16, dGate, hidden)) goto capture_fail;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2[layer], 1, hidden, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2[layer], 1, hidden, dim)) goto capture_fail;
+                if (!launch_add_inplace(g_dec_x, g_dec_ffn, dim)) goto capture_fail;
+            }
         }
     }
 
@@ -5963,6 +6305,7 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
     g_dec_graph_use_best_dtoh = use_best_dtoh;
     g_dec_graph_use_step_embed_from_adapter = use_step_embed_from_adapter;
     g_dec_graph_logits_mode = logits_mode;
+    g_dec_graph_use_quant = use_quant ? 1 : 0;
     if (vox_verbose >= 1) {
         int have_v2 = want_fp16 ? (g_fn_attn_dyn_fp16_v2 != 0) : (g_fn_attn_dyn_f32_v2 != 0);
         const char *attn = "v1";
@@ -5972,9 +6315,10 @@ static int decoder_graph_capture(vox_ctx_t *ctx, int input_on_device, int logits
         else if (use_v3) attn = "v3";
         else if (use_v2 && have_v2) attn = "v2";
         const char *logits_s = (logits_mode == 2) ? "int8_fused" : (logits_mode == 1) ? "bf16_fused" : "matmul";
-        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s, attn=%s%s%s%s%s%s%s%s%s, logits=%s)\n",
+        fprintf(stderr, "[cuda] decoder graph captured (kv_cache=%s, attn=%s%s%s%s%s%s%s%s%s%s, logits=%s)\n",
                 want_fp16 ? "fp16" : "fp32",
                 attn,
+                use_quant ? ", quant" : "",
                 use_merge_qkv ? ", merge_qkv" : "",
                 use_merge_ffn13 ? ", merge_ffn13" : "",
                 use_rope_dev ? ", rope_dev" : "",
@@ -6025,6 +6369,9 @@ static int vox_cuda_decoder_forward_full_graph(int *out_token,
         decoder_graph_destroy();
     }
     if (g_dec_graph_ready && g_dec_graph_logits_mode != want_logits_mode) {
+        decoder_graph_destroy();
+    }
+    if (g_dec_graph_ready && g_dec_graph_use_quant != (ctx->use_quant ? 1 : 0)) {
         decoder_graph_destroy();
     }
 
@@ -6148,8 +6495,9 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
     int hidden = VOX_DEC_HIDDEN;
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
-    int use_merge_qkv = merge_qkv_enabled();
-    int use_merge_ffn13 = merge_ffn13_enabled();
+    int use_quant = ctx->use_quant;
+    int use_merge_qkv = use_quant ? 0 : merge_qkv_enabled();
+    int use_merge_ffn13 = use_quant ? 0 : merge_ffn13_enabled();
 
     int pos = ctx->kv_cache_len;
     int total_seq = pos + 1;
@@ -6182,6 +6530,9 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
         if (!ensure_buffer(&g_dec_ffn13, &g_cap_dec_ffn13, (size_t)(2 * hidden) * sizeof(float))) return 0;
     }
 
+    /* Load quantized CUDA kernels if needed */
+    if (use_quant && !vox_cuda_quant_load_kernels()) return 0;
+
     CUresult r;
     if (!input_on_device) {
         r = cuMemcpyHtoDAsync(g_dec_x, input_embeds_or_null, (size_t)dim * sizeof(float), g_stream);
@@ -6206,105 +6557,160 @@ static int vox_cuda_decoder_forward_full_impl(int *out_token,
         CUdeviceptr d_ffn_norm = f32_cache_get(l->ffn_norm, (size_t)dim * sizeof(float));
         if (!d_attn_norm || !d_ffn_norm) return 0;
 
-        /* Attention norm */
-        if (!launch_rms_norm_to_bf16(g_dec_x_bf16, g_dec_x, d_attn_norm, 1, dim, VOX_DEC_NORM_EPS)) {
+        if (use_quant) {
+            /* === Quantized path: F32 activations, quantized GEMV kernels === */
+
+            /* Attention norm -> F32 (no BF16 conversion needed) */
             if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm, 1, dim, VOX_DEC_NORM_EPS)) return 0;
-            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) return 0;
-        }
 
-        /* Q,K,V projections */
-        size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
-        size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
-        CUdeviceptr dQ = 0, dK = 0, dV = 0;
-        if (use_merge_qkv) {
-            CUdeviceptr dWqkv = bf16_cache_get_merged_3(l->wq_weight_bf16,
-                                                        l->wq_weight_bf16, bytes_wq,
-                                                        l->wk_weight_bf16, bytes_wkv,
-                                                        l->wv_weight_bf16, bytes_wkv);
-            if (!dWqkv) return 0;
-            int qkv_dim = q_dim + 2 * kv_dim;
-            if (!gemm_t_bf16_bf16_f32(g_dec_qkv, g_dec_x_bf16, dWqkv, 1, dim, qkv_dim)) return 0;
-            dQ = g_dec_qkv;
-            dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
-            dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
-        } else {
-            CUdeviceptr dWq = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
-            CUdeviceptr dWk = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
-            CUdeviceptr dWv = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+            /* Q,K,V projections via quantized GEMV */
+            CUdeviceptr dWq = vox_cuda_quant_weight_get(l->wq_weight_q);
+            CUdeviceptr dWk = vox_cuda_quant_weight_get(l->wk_weight_q);
+            CUdeviceptr dWv = vox_cuda_quant_weight_get(l->wv_weight_q);
             if (!dWq || !dWk || !dWv) return 0;
-            dQ = g_dec_q;
-            dK = g_dec_k;
-            dV = g_dec_v;
-            if (!gemm_t_bf16_bf16_f32(dQ, g_dec_x_bf16, dWq, 1, dim, q_dim)) return 0;
-            if (!gemm_t_bf16_bf16_f32(dK, g_dec_x_bf16, dWk, 1, dim, kv_dim)) return 0;
-            if (!gemm_t_bf16_bf16_f32(dV, g_dec_x_bf16, dWv, 1, dim, kv_dim)) return 0;
-        }
+            if (!vox_cuda_quant_gemv_dev(g_dec_q, g_dec_x_norm, dWq, dim, q_dim, l->wq_qtype)) return 0;
+            if (!vox_cuda_quant_gemv_dev(g_dec_k, g_dec_x_norm, dWk, dim, kv_dim, l->wk_qtype)) return 0;
+            if (!vox_cuda_quant_gemv_dev(g_dec_v, g_dec_x_norm, dWv, dim, kv_dim, l->wv_qtype)) return 0;
 
-        /* RoPE */
-        if (!launch_apply_rope(dQ, g_dec_rope_freqs, 1, n_heads, head_dim)) return 0;
-        if (!launch_apply_rope(dK, g_dec_rope_freqs, 1, n_kv_heads, head_dim)) return 0;
+            /* RoPE */
+            if (!launch_apply_rope(g_dec_q, g_dec_rope_freqs, 1, n_heads, head_dim)) return 0;
+            if (!launch_apply_rope(g_dec_k, g_dec_rope_freqs, 1, n_kv_heads, head_dim)) return 0;
 
-        /* Attention */
-        if (!vox_cuda_decoder_attention_step_dev(g_dec_attn, dQ, dK, dV,
-                                                 layer, pos, total_seq, VOX_DEC_WINDOW)) {
-            return 0;
-        }
+            /* Attention */
+            if (!vox_cuda_decoder_attention_step_dev(g_dec_attn, g_dec_q, g_dec_k, g_dec_v,
+                                                     layer, pos, total_seq, VOX_DEC_WINDOW))
+                return 0;
 
-        /* Output projection */
-        size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
-        CUdeviceptr dWo = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
-        if (!dWo) return 0;
-        if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, q_dim)) return 0;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo, 1, q_dim, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo, 1, q_dim, dim)) return 0;
-            if (!launch_add_inplace(g_dec_x, g_dec_proj, dim)) return 0;
-        }
+            /* Output projection + residual (beta=1.0 accumulates into g_dec_x) */
+            CUdeviceptr dWo = vox_cuda_quant_weight_get(l->wo_weight_q);
+            if (!dWo) return 0;
+            if (!vox_cuda_quant_gemv_beta_dev(g_dec_x, g_dec_attn, dWo, q_dim, dim, l->wo_qtype, 1.0f)) return 0;
 
-        /* FFN */
-        CUdeviceptr d_ada = 0;
-        if (ctx->ada_scale) {
-            const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
-            d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
-            if (!d_ada) return 0;
-        }
-        if (d_ada && launch_rms_norm_to_bf16_ada(g_dec_x_bf16, g_dec_x, d_ffn_norm, d_ada, 1, dim, VOX_DEC_NORM_EPS)) {
-            /* Fused ffn-norm + ada + bf16 cast. */
-        } else {
+            /* FFN norm -> F32 + ada scale */
             if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm, 1, dim, VOX_DEC_NORM_EPS)) return 0;
-            if (d_ada) {
+            if (ctx->ada_scale) {
+                const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
+                CUdeviceptr d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
+                if (!d_ada) return 0;
                 if (!launch_mul_1p_inplace(g_dec_x_norm, d_ada, dim)) return 0;
             }
-            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) return 0;
-        }
 
-        size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
-        CUdeviceptr dGate = g_dec_gate;
-        if (use_merge_ffn13) {
-            CUdeviceptr dW13 = bf16_cache_get_merged_2(l->w1_weight_bf16,
-                                                       l->w1_weight_bf16, bytes_w1,
-                                                       l->w3_weight_bf16, bytes_w1);
-            if (!dW13) return 0;
-            int n13 = 2 * hidden;
-            if (!gemm_t_bf16_bf16_f32(g_dec_ffn13, g_dec_x_bf16, dW13, 1, dim, n13)) return 0;
-            dGate = g_dec_ffn13;
-            CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
-            if (!launch_silu_mul_inplace(dGate, dUp, hidden)) return 0;
-        } else {
-            CUdeviceptr dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
-            CUdeviceptr dW3 = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+            /* W1 (gate) and W3 (up) projections */
+            CUdeviceptr dW1 = vox_cuda_quant_weight_get(l->w1_weight_q);
+            CUdeviceptr dW3 = vox_cuda_quant_weight_get(l->w3_weight_q);
             if (!dW1 || !dW3) return 0;
-            if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1, 1, dim, hidden)) return 0;
-            if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3, 1, dim, hidden)) return 0;
+            if (!vox_cuda_quant_gemv_dev(g_dec_gate, g_dec_x_norm, dW1, dim, hidden, l->w1_qtype)) return 0;
+            if (!vox_cuda_quant_gemv_dev(g_dec_up, g_dec_x_norm, dW3, dim, hidden, l->w3_qtype)) return 0;
             if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) return 0;
-        }
 
-        size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
-        CUdeviceptr dW2 = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
-        if (!dW2) return 0;
-        if (!launch_f32_to_bf16(g_dec_gate_bf16, dGate, hidden)) return 0;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2, 1, hidden, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2, 1, hidden, dim)) return 0;
-            if (!launch_add_inplace(g_dec_x, g_dec_ffn, dim)) return 0;
+            /* W2 (down) + residual */
+            CUdeviceptr dW2 = vox_cuda_quant_weight_get(l->w2_weight_q);
+            if (!dW2) return 0;
+            if (!vox_cuda_quant_gemv_beta_dev(g_dec_x, g_dec_gate, dW2, hidden, dim, l->w2_qtype, 1.0f)) return 0;
+
+        } else {
+            /* === BF16 path: cuBLAS GEMM === */
+
+            /* Attention norm */
+            if (!launch_rms_norm_to_bf16(g_dec_x_bf16, g_dec_x, d_attn_norm, 1, dim, VOX_DEC_NORM_EPS)) {
+                if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm, 1, dim, VOX_DEC_NORM_EPS)) return 0;
+                if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) return 0;
+            }
+
+            /* Q,K,V projections */
+            size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
+            CUdeviceptr dQ = 0, dK = 0, dV = 0;
+            if (use_merge_qkv) {
+                CUdeviceptr dWqkv = bf16_cache_get_merged_3(l->wq_weight_bf16,
+                                                            l->wq_weight_bf16, bytes_wq,
+                                                            l->wk_weight_bf16, bytes_wkv,
+                                                            l->wv_weight_bf16, bytes_wkv);
+                if (!dWqkv) return 0;
+                int qkv_dim = q_dim + 2 * kv_dim;
+                if (!gemm_t_bf16_bf16_f32(g_dec_qkv, g_dec_x_bf16, dWqkv, 1, dim, qkv_dim)) return 0;
+                dQ = g_dec_qkv;
+                dK = g_dec_qkv + (size_t)q_dim * sizeof(float);
+                dV = g_dec_qkv + (size_t)(q_dim + kv_dim) * sizeof(float);
+            } else {
+                CUdeviceptr dWq = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+                CUdeviceptr dWk = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
+                CUdeviceptr dWv = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+                if (!dWq || !dWk || !dWv) return 0;
+                dQ = g_dec_q;
+                dK = g_dec_k;
+                dV = g_dec_v;
+                if (!gemm_t_bf16_bf16_f32(dQ, g_dec_x_bf16, dWq, 1, dim, q_dim)) return 0;
+                if (!gemm_t_bf16_bf16_f32(dK, g_dec_x_bf16, dWk, 1, dim, kv_dim)) return 0;
+                if (!gemm_t_bf16_bf16_f32(dV, g_dec_x_bf16, dWv, 1, dim, kv_dim)) return 0;
+            }
+
+            /* RoPE */
+            if (!launch_apply_rope(dQ, g_dec_rope_freqs, 1, n_heads, head_dim)) return 0;
+            if (!launch_apply_rope(dK, g_dec_rope_freqs, 1, n_kv_heads, head_dim)) return 0;
+
+            /* Attention */
+            if (!vox_cuda_decoder_attention_step_dev(g_dec_attn, dQ, dK, dV,
+                                                     layer, pos, total_seq, VOX_DEC_WINDOW)) {
+                return 0;
+            }
+
+            /* Output projection */
+            size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
+            CUdeviceptr dWo = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+            if (!dWo) return 0;
+            if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, q_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo, 1, q_dim, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo, 1, q_dim, dim)) return 0;
+                if (!launch_add_inplace(g_dec_x, g_dec_proj, dim)) return 0;
+            }
+
+            /* FFN */
+            CUdeviceptr d_ada = 0;
+            if (ctx->ada_scale) {
+                const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
+                d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
+                if (!d_ada) return 0;
+            }
+            if (d_ada && launch_rms_norm_to_bf16_ada(g_dec_x_bf16, g_dec_x, d_ffn_norm, d_ada, 1, dim, VOX_DEC_NORM_EPS)) {
+                /* Fused ffn-norm + ada + bf16 cast. */
+            } else {
+                if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm, 1, dim, VOX_DEC_NORM_EPS)) return 0;
+                if (d_ada) {
+                    if (!launch_mul_1p_inplace(g_dec_x_norm, d_ada, dim)) return 0;
+                }
+                if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, dim)) return 0;
+            }
+
+            size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
+            CUdeviceptr dGate = g_dec_gate;
+            if (use_merge_ffn13) {
+                CUdeviceptr dW13 = bf16_cache_get_merged_2(l->w1_weight_bf16,
+                                                           l->w1_weight_bf16, bytes_w1,
+                                                           l->w3_weight_bf16, bytes_w1);
+                if (!dW13) return 0;
+                int n13 = 2 * hidden;
+                if (!gemm_t_bf16_bf16_f32(g_dec_ffn13, g_dec_x_bf16, dW13, 1, dim, n13)) return 0;
+                dGate = g_dec_ffn13;
+                CUdeviceptr dUp = g_dec_ffn13 + (size_t)hidden * sizeof(float);
+                if (!launch_silu_mul_inplace(dGate, dUp, hidden)) return 0;
+            } else {
+                CUdeviceptr dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+                CUdeviceptr dW3 = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+                if (!dW1 || !dW3) return 0;
+                if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1, 1, dim, hidden)) return 0;
+                if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3, 1, dim, hidden)) return 0;
+                if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, hidden)) return 0;
+            }
+
+            size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
+            CUdeviceptr dW2 = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+            if (!dW2) return 0;
+            if (!launch_f32_to_bf16(g_dec_gate_bf16, dGate, hidden)) return 0;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2, 1, hidden, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2, 1, hidden, dim)) return 0;
+                if (!launch_add_inplace(g_dec_x, g_dec_ffn, dim)) return 0;
+            }
         }
     }
 
@@ -6491,8 +6897,9 @@ static int vox_cuda_decoder_prefill_full_impl(vox_ctx_t *ctx,
     int hidden = VOX_DEC_HIDDEN;
     int q_dim = n_heads * head_dim;
     int kv_dim = n_kv_heads * head_dim;
-    int use_merge_qkv = merge_qkv_enabled();
-    int use_merge_ffn13 = merge_ffn13_enabled();
+    int use_quant = ctx->use_quant;
+    int use_merge_qkv = use_quant ? 0 : merge_qkv_enabled();
+    int use_merge_ffn13 = use_quant ? 0 : merge_ffn13_enabled();
 
     int start_pos = ctx->kv_cache_len;
     if (start_pos != 0) {
@@ -6503,6 +6910,9 @@ static int vox_cuda_decoder_prefill_full_impl(vox_ctx_t *ctx,
 
     int want_max_seq = ctx->kv_cache_max > 0 ? ctx->kv_cache_max : (VOX_DEC_WINDOW + 2048);
     if (!ensure_kv_cache(want_max_seq, kv_dim)) return 0;
+
+    /* Load quantized CUDA kernels if needed */
+    if (use_quant && !vox_cuda_quant_load_kernels()) return 0;
 
     /* Resize work buffers for seq_len. */
     size_t bytes_x = (size_t)seq_len * (size_t)dim * sizeof(float);
@@ -6555,115 +6965,201 @@ static int vox_cuda_decoder_prefill_full_impl(vox_ctx_t *ctx,
         CUdeviceptr d_ffn_norm = f32_cache_get(l->ffn_norm, (size_t)dim * sizeof(float));
         if (!d_attn_norm || !d_ffn_norm) return 0;
 
-        /* ---- Self-attention ---- */
-        if (!launch_rms_norm_to_bf16(g_dec_x_bf16, g_dec_x, d_attn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) {
+        if (use_quant) {
+            /* === Quantized path: F32 activations, quantized GEMV kernels === */
+
+            /* Attention norm -> F32 (no BF16 conversion needed) */
             if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
-            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
-        }
 
-        /* Q, K, V projections (no bias in decoder, bf16 weights) */
-        size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
-        size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
-        CUdeviceptr dWq = 0, dWk = 0, dWv = 0;
-        if (use_merge_qkv) {
-            CUdeviceptr dWqkv = bf16_cache_get_merged_3(l->wq_weight_bf16,
-                                                        l->wq_weight_bf16, bytes_wq,
-                                                        l->wk_weight_bf16, bytes_wkv,
-                                                        l->wv_weight_bf16, bytes_wkv);
-            if (!dWqkv) return 0;
-            dWq = dWqkv;
-            dWk = dWqkv + (CUdeviceptr)bytes_wq;
-            dWv = dWqkv + (CUdeviceptr)(bytes_wq + bytes_wkv);
-        } else {
-            dWq = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
-            dWk = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
-            dWv = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
-            if (!dWq || !dWk || !dWv) return 0;
-        }
+            /* Q,K,V projections via quantized GEMV (loop over positions) */
+            CUdeviceptr dWq_q = vox_cuda_quant_weight_get(l->wq_weight_q);
+            CUdeviceptr dWk_q = vox_cuda_quant_weight_get(l->wk_weight_q);
+            CUdeviceptr dWv_q = vox_cuda_quant_weight_get(l->wv_weight_q);
+            if (!dWq_q || !dWk_q || !dWv_q) return 0;
+            for (int s = 0; s < seq_len; s++) {
+                CUdeviceptr xi = g_dec_x_norm + (size_t)s * dim * sizeof(float);
+                CUdeviceptr qi = g_dec_q + (size_t)s * q_dim * sizeof(float);
+                CUdeviceptr ki = g_dec_k + (size_t)s * kv_dim * sizeof(float);
+                CUdeviceptr vi = g_dec_v + (size_t)s * kv_dim * sizeof(float);
+                if (!vox_cuda_quant_gemv_dev(qi, xi, dWq_q, dim, q_dim, l->wq_qtype)) return 0;
+                if (!vox_cuda_quant_gemv_dev(ki, xi, dWk_q, dim, kv_dim, l->wk_qtype)) return 0;
+                if (!vox_cuda_quant_gemv_dev(vi, xi, dWv_q, dim, kv_dim, l->wv_qtype)) return 0;
+            }
 
-        if (!gemm_t_bf16_bf16_f32(g_dec_q, g_dec_x_bf16, dWq, seq_len, dim, q_dim)) return 0;
-        if (!gemm_t_bf16_bf16_f32(g_dec_k, g_dec_x_bf16, dWk, seq_len, dim, kv_dim)) return 0;
-        if (!gemm_t_bf16_bf16_f32(g_dec_v, g_dec_x_bf16, dWv, seq_len, dim, kv_dim)) return 0;
+            /* Apply RoPE */
+            if (!launch_apply_rope(g_dec_q, g_dec_rope_freqs, seq_len, n_heads, head_dim)) return 0;
+            if (!launch_apply_rope(g_dec_k, g_dec_rope_freqs, seq_len, n_kv_heads, head_dim)) return 0;
 
-        /* Apply RoPE */
-        if (!launch_apply_rope(g_dec_q, g_dec_rope_freqs, seq_len, n_heads, head_dim)) return 0;
-        if (!launch_apply_rope(g_dec_k, g_dec_rope_freqs, seq_len, n_kv_heads, head_dim)) return 0;
+            /* Store K, V in device KV cache */
+            if (!vox_cuda_kv_cache_append_block_dev(layer, start_pos, seq_len, kv_dim, VOX_DEC_WINDOW,
+                                                    g_dec_k, g_dec_v))
+                return 0;
 
-        /* Store K, V in device KV cache for the upcoming single-token decode loop. */
-        if (!vox_cuda_kv_cache_append_block_dev(layer, start_pos, seq_len, kv_dim, VOX_DEC_WINDOW,
-                                                g_dec_k, g_dec_v)) {
-            return 0;
-        }
+            /* Causal attention */
+            int total_seq = start_pos + seq_len;
+            if (!vox_cuda_causal_attention_dev(g_dec_attn, g_dec_q, g_dec_k, g_dec_v,
+                                               seq_len, total_seq, n_heads, n_kv_heads,
+                                               head_dim, attn_scale, VOX_DEC_WINDOW, start_pos))
+                return 0;
 
-        /* Causal attention over the full cached sequence (here: start_pos=0) */
-        int total_seq = start_pos + seq_len;
-        if (!vox_cuda_causal_attention_dev(g_dec_attn, g_dec_q, g_dec_k, g_dec_v,
-                                           seq_len, total_seq, n_heads, n_kv_heads,
-                                           head_dim, attn_scale, VOX_DEC_WINDOW, start_pos)) {
-            return 0;
-        }
+            /* Output projection + residual (loop over positions, beta=1.0) */
+            CUdeviceptr dWo_q = vox_cuda_quant_weight_get(l->wo_weight_q);
+            if (!dWo_q) return 0;
+            for (int s = 0; s < seq_len; s++) {
+                CUdeviceptr xi = g_dec_x + (size_t)s * dim * sizeof(float);
+                CUdeviceptr ai = g_dec_attn + (size_t)s * q_dim * sizeof(float);
+                if (!vox_cuda_quant_gemv_beta_dev(xi, ai, dWo_q, q_dim, dim, l->wo_qtype, 1.0f)) return 0;
+            }
 
-        /* Output projection + residual */
-        size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
-        CUdeviceptr dWo = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
-        if (!dWo) return 0;
-
-        if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, seq_len * q_dim)) return 0;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo, seq_len, q_dim, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo, seq_len, q_dim, dim)) return 0;
-            if (!launch_add_inplace(g_dec_x, g_dec_proj, seq_len * dim)) return 0;
-        }
-
-        /* ---- FFN ---- */
-        CUdeviceptr d_ada = 0;
-        if (ctx->ada_scale) {
-            const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
-            d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
-            if (!d_ada) return 0;
-        }
-        if (d_ada && launch_rms_norm_to_bf16_ada(g_dec_x_bf16, g_dec_x, d_ffn_norm, d_ada, seq_len, dim, VOX_DEC_NORM_EPS)) {
-            /* Fused ffn-norm + ada + bf16 cast. */
-        } else {
+            /* FFN norm -> F32 + ada scale (no BF16 conversion) */
             if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
-            if (d_ada) {
+            if (ctx->ada_scale) {
+                const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
+                CUdeviceptr d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
+                if (!d_ada) return 0;
                 if (!launch_mul_1p_rows_inplace(g_dec_x_norm, d_ada, seq_len, dim)) {
-                    /* Fallback: per-row kernel launch. */
                     for (int s = 0; s < seq_len; s++) {
-                        CUdeviceptr row = g_dec_x_norm + (size_t)s * (size_t)dim * sizeof(float);
+                        CUdeviceptr row = g_dec_x_norm + (size_t)s * dim * sizeof(float);
                         if (!launch_mul_1p_inplace(row, d_ada, dim)) return 0;
                     }
                 }
             }
-            if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
-        }
 
-        size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
-        CUdeviceptr dW1 = 0, dW3 = 0;
-        if (use_merge_ffn13) {
-            CUdeviceptr dW13 = bf16_cache_get_merged_2(l->w1_weight_bf16,
-                                                       l->w1_weight_bf16, bytes_w1,
-                                                       l->w3_weight_bf16, bytes_w1);
-            if (!dW13) return 0;
-            dW1 = dW13;
-            dW3 = dW13 + (CUdeviceptr)bytes_w1;
+            /* W1 (gate) and W3 (up) projections (loop over positions) */
+            CUdeviceptr dW1_q = vox_cuda_quant_weight_get(l->w1_weight_q);
+            CUdeviceptr dW3_q = vox_cuda_quant_weight_get(l->w3_weight_q);
+            if (!dW1_q || !dW3_q) return 0;
+            for (int s = 0; s < seq_len; s++) {
+                CUdeviceptr xi = g_dec_x_norm + (size_t)s * dim * sizeof(float);
+                CUdeviceptr gi = g_dec_gate + (size_t)s * hidden * sizeof(float);
+                CUdeviceptr ui = g_dec_up + (size_t)s * hidden * sizeof(float);
+                if (!vox_cuda_quant_gemv_dev(gi, xi, dW1_q, dim, hidden, l->w1_qtype)) return 0;
+                if (!vox_cuda_quant_gemv_dev(ui, xi, dW3_q, dim, hidden, l->w3_qtype)) return 0;
+            }
+            if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, seq_len * hidden)) return 0;
+
+            /* W2 (down) + residual (loop over positions, beta=1.0) */
+            CUdeviceptr dW2_q = vox_cuda_quant_weight_get(l->w2_weight_q);
+            if (!dW2_q) return 0;
+            for (int s = 0; s < seq_len; s++) {
+                CUdeviceptr xi = g_dec_x + (size_t)s * dim * sizeof(float);
+                CUdeviceptr gi = g_dec_gate + (size_t)s * hidden * sizeof(float);
+                if (!vox_cuda_quant_gemv_beta_dev(xi, gi, dW2_q, hidden, dim, l->w2_qtype, 1.0f)) return 0;
+            }
+
         } else {
-            dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
-            dW3 = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
-            if (!dW1 || !dW3) return 0;
-        }
+            /* === BF16 path: cuBLAS GEMM === */
 
-        if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1, seq_len, dim, hidden)) return 0;
-        if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3, seq_len, dim, hidden)) return 0;
-        if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, seq_len * hidden)) return 0;
+            /* ---- Self-attention ---- */
+            if (!launch_rms_norm_to_bf16(g_dec_x_bf16, g_dec_x, d_attn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) {
+                if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_attn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
+                if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
+            }
 
-        size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
-        CUdeviceptr dW2 = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
-        if (!dW2) return 0;
+            /* Q, K, V projections (no bias in decoder, bf16 weights) */
+            size_t bytes_wq = (size_t)q_dim * (size_t)dim * sizeof(uint16_t);
+            size_t bytes_wkv = (size_t)kv_dim * (size_t)dim * sizeof(uint16_t);
+            CUdeviceptr dWq = 0, dWk = 0, dWv = 0;
+            if (use_merge_qkv) {
+                CUdeviceptr dWqkv = bf16_cache_get_merged_3(l->wq_weight_bf16,
+                                                            l->wq_weight_bf16, bytes_wq,
+                                                            l->wk_weight_bf16, bytes_wkv,
+                                                            l->wv_weight_bf16, bytes_wkv);
+                if (!dWqkv) return 0;
+                dWq = dWqkv;
+                dWk = dWqkv + (CUdeviceptr)bytes_wq;
+                dWv = dWqkv + (CUdeviceptr)(bytes_wq + bytes_wkv);
+            } else {
+                dWq = bf16_cache_get(l->wq_weight_bf16, bytes_wq);
+                dWk = bf16_cache_get(l->wk_weight_bf16, bytes_wkv);
+                dWv = bf16_cache_get(l->wv_weight_bf16, bytes_wkv);
+                if (!dWq || !dWk || !dWv) return 0;
+            }
 
-        if (!launch_f32_to_bf16(g_dec_gate_bf16, g_dec_gate, seq_len * hidden)) return 0;
-        if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2, seq_len, hidden, dim, 1.0f)) {
-            if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2, seq_len, hidden, dim)) return 0;
-            if (!launch_add_inplace(g_dec_x, g_dec_ffn, seq_len * dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_dec_q, g_dec_x_bf16, dWq, seq_len, dim, q_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_dec_k, g_dec_x_bf16, dWk, seq_len, dim, kv_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_dec_v, g_dec_x_bf16, dWv, seq_len, dim, kv_dim)) return 0;
+
+            /* Apply RoPE */
+            if (!launch_apply_rope(g_dec_q, g_dec_rope_freqs, seq_len, n_heads, head_dim)) return 0;
+            if (!launch_apply_rope(g_dec_k, g_dec_rope_freqs, seq_len, n_kv_heads, head_dim)) return 0;
+
+            /* Store K, V in device KV cache for the upcoming single-token decode loop. */
+            if (!vox_cuda_kv_cache_append_block_dev(layer, start_pos, seq_len, kv_dim, VOX_DEC_WINDOW,
+                                                    g_dec_k, g_dec_v)) {
+                return 0;
+            }
+
+            /* Causal attention over the full cached sequence (here: start_pos=0) */
+            int total_seq = start_pos + seq_len;
+            if (!vox_cuda_causal_attention_dev(g_dec_attn, g_dec_q, g_dec_k, g_dec_v,
+                                               seq_len, total_seq, n_heads, n_kv_heads,
+                                               head_dim, attn_scale, VOX_DEC_WINDOW, start_pos)) {
+                return 0;
+            }
+
+            /* Output projection + residual */
+            size_t bytes_wo = (size_t)dim * (size_t)q_dim * sizeof(uint16_t);
+            CUdeviceptr dWo = bf16_cache_get(l->wo_weight_bf16, bytes_wo);
+            if (!dWo) return 0;
+
+            if (!launch_f32_to_bf16(g_dec_attn_bf16, g_dec_attn, seq_len * q_dim)) return 0;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_attn_bf16, dWo, seq_len, q_dim, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_proj, g_dec_attn_bf16, dWo, seq_len, q_dim, dim)) return 0;
+                if (!launch_add_inplace(g_dec_x, g_dec_proj, seq_len * dim)) return 0;
+            }
+
+            /* ---- FFN ---- */
+            CUdeviceptr d_ada = 0;
+            if (ctx->ada_scale) {
+                const float *ada = ctx->ada_scale + (size_t)layer * (size_t)dim;
+                d_ada = f32_cache_get(ada, (size_t)dim * sizeof(float));
+                if (!d_ada) return 0;
+            }
+            if (d_ada && launch_rms_norm_to_bf16_ada(g_dec_x_bf16, g_dec_x, d_ffn_norm, d_ada, seq_len, dim, VOX_DEC_NORM_EPS)) {
+                /* Fused ffn-norm + ada + bf16 cast. */
+            } else {
+                if (!launch_rms_norm(g_dec_x_norm, g_dec_x, d_ffn_norm, seq_len, dim, VOX_DEC_NORM_EPS)) return 0;
+                if (d_ada) {
+                    if (!launch_mul_1p_rows_inplace(g_dec_x_norm, d_ada, seq_len, dim)) {
+                        /* Fallback: per-row kernel launch. */
+                        for (int s = 0; s < seq_len; s++) {
+                            CUdeviceptr row = g_dec_x_norm + (size_t)s * (size_t)dim * sizeof(float);
+                            if (!launch_mul_1p_inplace(row, d_ada, dim)) return 0;
+                        }
+                    }
+                }
+                if (!launch_f32_to_bf16(g_dec_x_bf16, g_dec_x_norm, seq_len * dim)) return 0;
+            }
+
+            size_t bytes_w1 = (size_t)hidden * (size_t)dim * sizeof(uint16_t);
+            CUdeviceptr dW1 = 0, dW3 = 0;
+            if (use_merge_ffn13) {
+                CUdeviceptr dW13 = bf16_cache_get_merged_2(l->w1_weight_bf16,
+                                                           l->w1_weight_bf16, bytes_w1,
+                                                           l->w3_weight_bf16, bytes_w1);
+                if (!dW13) return 0;
+                dW1 = dW13;
+                dW3 = dW13 + (CUdeviceptr)bytes_w1;
+            } else {
+                dW1 = bf16_cache_get(l->w1_weight_bf16, bytes_w1);
+                dW3 = bf16_cache_get(l->w3_weight_bf16, bytes_w1);
+                if (!dW1 || !dW3) return 0;
+            }
+
+            if (!gemm_t_bf16_bf16_f32(g_dec_gate, g_dec_x_bf16, dW1, seq_len, dim, hidden)) return 0;
+            if (!gemm_t_bf16_bf16_f32(g_dec_up, g_dec_x_bf16, dW3, seq_len, dim, hidden)) return 0;
+            if (!launch_silu_mul_inplace(g_dec_gate, g_dec_up, seq_len * hidden)) return 0;
+
+            size_t bytes_w2 = (size_t)dim * (size_t)hidden * sizeof(uint16_t);
+            CUdeviceptr dW2 = bf16_cache_get(l->w2_weight_bf16, bytes_w2);
+            if (!dW2) return 0;
+
+            if (!launch_f32_to_bf16(g_dec_gate_bf16, g_dec_gate, seq_len * hidden)) return 0;
+            if (!gemm_t_bf16_bf16_f32_beta(g_dec_x, g_dec_gate_bf16, dW2, seq_len, hidden, dim, 1.0f)) {
+                if (!gemm_t_bf16_bf16_f32(g_dec_ffn, g_dec_gate_bf16, dW2, seq_len, hidden, dim)) return 0;
+                if (!launch_add_inplace(g_dec_x, g_dec_ffn, seq_len * dim)) return 0;
+            }
         }
     }
 
@@ -6691,6 +7187,75 @@ int vox_cuda_decoder_prefill_full(vox_ctx_t *ctx,
 out:
     cuda_api_unlock();
     return ok;
+}
+
+/* ========================================================================
+ * Encoder warmup: pre-populate dequant BF16 cache + GPU BF16 cache
+ * Call once after vox_load() to move the ~1s dequant overhead to load time.
+ * ======================================================================== */
+void vox_cuda_warmup_encoder(vox_ctx_t *ctx) {
+    if (!ctx || !ctx->use_quant) return;
+    if (!vox_cuda_available()) return;
+
+    cuda_api_lock();
+    cuda_ctx_bind(ctx);
+
+    int dim = VOX_ENC_DIM;         /* 1280 */
+    int qkv_dim = VOX_ENC_HEADS * VOX_ENC_HEAD_DIM; /* 2048 */
+    int hidden = VOX_ENC_HIDDEN;   /* 5120 */
+    vox_encoder_t *enc = &ctx->encoder;
+
+    if (vox_verbose >= 1)
+        fprintf(stderr, "Warming up encoder dequant cache (%d layers)...\n", VOX_ENC_LAYERS);
+
+    for (int layer = 0; layer < VOX_ENC_LAYERS; layer++) {
+        vox_enc_layer_t *l = &enc->layers[layer];
+
+        /* Dequant Q4_K -> BF16 on CPU (cached) */
+        uint16_t *hWq = enc_dequant_bf16_get(l->wq_weight_q, l->wq_qtype, dim, qkv_dim);
+        uint16_t *hWk = enc_dequant_bf16_get(l->wk_weight_q, l->wk_qtype, dim, qkv_dim);
+        uint16_t *hWv = enc_dequant_bf16_get(l->wv_weight_q, l->wv_qtype, dim, qkv_dim);
+        uint16_t *hWo = enc_dequant_bf16_get(l->wo_weight_q, l->wo_qtype, qkv_dim, dim);
+        uint16_t *hW1 = enc_dequant_bf16_get(l->w1_weight_q, l->w1_qtype, dim, hidden);
+        uint16_t *hW3 = enc_dequant_bf16_get(l->w3_weight_q, l->w3_qtype, dim, hidden);
+        uint16_t *hW2 = enc_dequant_bf16_get(l->w2_weight_q, l->w2_qtype, hidden, dim);
+
+        if (!hWq || !hWk || !hWv || !hWo || !hW1 || !hW3 || !hW2) {
+            fprintf(stderr, "[warmup] dequant failed at layer %d, skipping\n", layer);
+            break;
+        }
+
+        /* Upload BF16 to GPU (cached) */
+        size_t bytes_qkv = (size_t)qkv_dim * dim * sizeof(uint16_t);
+        size_t bytes_wo  = (size_t)dim * qkv_dim * sizeof(uint16_t);
+        size_t bytes_w1  = (size_t)hidden * dim * sizeof(uint16_t);
+        size_t bytes_w2  = (size_t)dim * hidden * sizeof(uint16_t);
+
+        bf16_cache_get(hWq, bytes_qkv);
+        bf16_cache_get(hWk, bytes_qkv);
+        bf16_cache_get(hWv, bytes_qkv);
+        bf16_cache_get(hWo, bytes_wo);
+        bf16_cache_get(hW1, bytes_w1);
+        bf16_cache_get(hW3, bytes_w1);
+        bf16_cache_get(hW2, bytes_w2);
+
+        /* Also cache f32 biases and norms */
+        f32_cache_get(l->attention_norm, (size_t)dim * sizeof(float));
+        f32_cache_get(l->ffn_norm, (size_t)dim * sizeof(float));
+        f32_cache_get(l->wq_bias, (size_t)qkv_dim * sizeof(float));
+        f32_cache_get(l->wv_bias, (size_t)qkv_dim * sizeof(float));
+        f32_cache_get(l->wo_bias, (size_t)dim * sizeof(float));
+        f32_cache_get(l->w2_bias, (size_t)dim * sizeof(float));
+    }
+
+    /* Also cache encoder final norm */
+    f32_cache_get(enc->norm, (size_t)dim * sizeof(float));
+
+    cuda_ctx_state_save_bound();
+    cuda_api_unlock();
+
+    if (vox_verbose >= 1)
+        fprintf(stderr, "Encoder warmup done (dequant cache: %d entries)\n", g_enc_dq_len);
 }
 
 /* End of voxtral_cuda.c */

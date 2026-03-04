@@ -29,8 +29,9 @@ endif
 # - voxtral_cuda_stub.c provides non-CUDA stubs so CPU/Metal builds don't
 #   compile or link against the real CUDA implementation by accident.
 SRCS_COMMON = voxtral.c voxtral_kernels.c voxtral_audio.c voxtral_encoder.c voxtral_decoder.c \
-              voxtral_tokenizer.c voxtral_safetensors.c voxtral_mic_macos.c voxtral_cuda_stub.c
-CUDA_SRCS = $(SRCS_COMMON) voxtral_cuda.c
+              voxtral_tokenizer.c voxtral_safetensors.c voxtral_quant_loader.c voxtral_quant_kernels.c \
+              voxtral_mic_macos.c voxtral_cuda_stub.c
+CUDA_SRCS = $(SRCS_COMMON) voxtral_cuda.c voxtral_cuda_quant.c
 SRCS = $(SRCS_COMMON)
 OBJS = $(SRCS:.c=.o)
 MAIN = main.c
@@ -191,7 +192,7 @@ test:
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) voxtral_cuda.o *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
+	rm -f $(OBJS) voxtral_cuda.o voxtral_cuda_quant.o *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
 	rm -f voxtral_shaders_source.h
 	rm -f $(CUDA_CUBIN) $(CUDA_CUBIN_HDR)
 
@@ -213,14 +214,17 @@ endif
 # =============================================================================
 # Dependencies
 # =============================================================================
-voxtral.o: voxtral.c voxtral.h voxtral_kernels.h voxtral_safetensors.h voxtral_audio.h voxtral_tokenizer.h
+voxtral.o: voxtral.c voxtral.h voxtral_kernels.h voxtral_safetensors.h voxtral_quant_loader.h voxtral_audio.h voxtral_tokenizer.h
 voxtral_kernels.o: voxtral_kernels.c voxtral_kernels.h voxtral_cuda.h
 voxtral_cuda.o: voxtral_cuda.c voxtral_cuda.h
+voxtral_cuda_quant.o: voxtral_cuda_quant.c voxtral_cuda_quant.h voxtral_quant.h voxtral.h
 voxtral_audio.o: voxtral_audio.c voxtral_audio.h
-voxtral_encoder.o: voxtral_encoder.c voxtral.h voxtral_kernels.h voxtral_safetensors.h
-voxtral_decoder.o: voxtral_decoder.c voxtral.h voxtral_kernels.h voxtral_safetensors.h
+voxtral_encoder.o: voxtral_encoder.c voxtral.h voxtral_kernels.h voxtral_quant.h voxtral_safetensors.h
+voxtral_decoder.o: voxtral_decoder.c voxtral.h voxtral_kernels.h voxtral_quant.h voxtral_safetensors.h
 voxtral_tokenizer.o: voxtral_tokenizer.c voxtral_tokenizer.h
 voxtral_safetensors.o: voxtral_safetensors.c voxtral_safetensors.h
+voxtral_quant_loader.o: voxtral_quant_loader.c voxtral_quant.h voxtral.h
+voxtral_quant_kernels.o: voxtral_quant_kernels.c voxtral_quant.h voxtral_kernels.h
 main.o: main.c voxtral.h voxtral_kernels.h voxtral_mic.h
 voxtral_mic_macos.o: voxtral_mic_macos.c voxtral_mic.h
 inspect_weights.o: inspect_weights.c voxtral_safetensors.h

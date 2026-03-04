@@ -3385,3 +3385,425 @@ extern "C" __global__ void vox_masked_softmax_causal_inplace_f32(float *scores,
         }
     }
 }
+
+/* ========================================================================
+ * Quantized matmul kernels for VQF format
+ *
+ * All kernels compute: out[N] = activation[K] @ weight^T[N, K]
+ * where weight is stored in quantized block format (row-major, each row
+ * of K values is a sequence of quantized blocks).
+ *
+ * Grid: (N + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK
+ * Block: 256 threads (8 warps)
+ * ======================================================================== */
+
+/* ---- Q8_0 block layout (matches voxtral_quant.h) ----
+ * 36 bytes per block of 32 values:
+ *   float scale (4 bytes)
+ *   int8_t quants[32] (32 bytes)
+ * Dequant: w[i] = scale * quants[i]
+ */
+
+/* Single-token matmul: out[N] = x[K] @ W_q8_0^T[N, K]
+ * Each warp processes multiple output rows. */
+extern "C" __global__ void vox_gemv_q8_0(float *out,
+                                          const float *x,
+                                          const void *W_q8_0,
+                                          int K,
+                                          int N) {
+    const int WARPS = 8;
+    const int ROWS_PER_WARP = 4;
+    const int ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP;
+
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int base = (int)blockIdx.x * ROWS_PER_BLOCK;
+    if (base >= N) return;
+
+    /* Load activation into shared memory */
+    extern __shared__ float sh_x[];
+    for (int i = tid; i < K; i += (int)blockDim.x) {
+        sh_x[i] = x[i];
+    }
+    __syncthreads();
+
+    int blocks_per_row = K / 32;  /* number of Q8_0 blocks per row */
+    size_t row_bytes = (size_t)blocks_per_row * 36;
+
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int row = base + warp + r * WARPS;
+        if (row >= N) continue;
+
+        const uint8_t *row_data = (const uint8_t *)W_q8_0 + (size_t)row * row_bytes;
+
+        float acc = 0.0f;
+        /* Each lane handles blocks_per_row/32 blocks (or more via striding) */
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const uint8_t *block = row_data + (size_t)b * 36;
+            float scale = *(const float *)block;
+            const int8_t *quants = (const int8_t *)(block + 4);
+
+            /* Dot product: sum(x[b*32 + i] * scale * quants[i]) */
+            int k_base = b * 32;
+            float partial = 0.0f;
+            for (int i = 0; i < 32; i++) {
+                partial += sh_x[k_base + i] * (float)quants[i];
+            }
+            acc += scale * partial;
+        }
+
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            out[row] = acc;
+        }
+    }
+}
+
+/* ---- Q4_0 block layout (matches voxtral_quant.h) ----
+ * 20 bytes per block of 32 values:
+ *   float scale (4 bytes)
+ *   uint8_t nibs[16] (16 bytes) — packed nibbles (lo=even, hi=odd)
+ * Dequant: w[i] = scale * (nibble[i] - 8)
+ */
+
+extern "C" __global__ void vox_gemv_q4_0(float *out,
+                                          const float *x,
+                                          const void *W_q4_0,
+                                          int K,
+                                          int N) {
+    const int WARPS = 8;
+    const int ROWS_PER_WARP = 4;
+    const int ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP;
+
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int base = (int)blockIdx.x * ROWS_PER_BLOCK;
+    if (base >= N) return;
+
+    extern __shared__ float sh_x[];
+    for (int i = tid; i < K; i += (int)blockDim.x) {
+        sh_x[i] = x[i];
+    }
+    __syncthreads();
+
+    int blocks_per_row = K / 32;
+    size_t row_bytes = (size_t)blocks_per_row * 20;
+
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int row = base + warp + r * WARPS;
+        if (row >= N) continue;
+
+        const uint8_t *row_data = (const uint8_t *)W_q4_0 + (size_t)row * row_bytes;
+
+        float acc = 0.0f;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const uint8_t *block = row_data + (size_t)b * 20;
+            float scale = *(const float *)block;
+            const uint8_t *nibs = block + 4;
+
+            int k_base = b * 32;
+            float partial = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                uint8_t byte = nibs[i];
+                int lo = (byte & 0xF) - 8;
+                int hi = ((byte >> 4) & 0xF) - 8;
+                partial += sh_x[k_base + 2 * i] * (float)lo;
+                partial += sh_x[k_base + 2 * i + 1] * (float)hi;
+            }
+            acc += scale * partial;
+        }
+
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            out[row] = acc;
+        }
+    }
+}
+
+/* ---- Q4_K block layout (matches voxtral_quant.h) ----
+ * 148 bytes per super-block of 256 values (8 sub-blocks of 32):
+ *   float super_scale (4 bytes)
+ *   float super_min (4 bytes)
+ *   uint8_t scales[12] (12 bytes) — packed 6-bit sub-block scales+mins
+ *   uint8_t nibs[128] (128 bytes) — 256 nibbles packed
+ *
+ * Scale packing (per pair of sub-blocks i*2, i*2+1, i=0..3):
+ *   byte[i*3+0] = (q_scales[i*2] & 0x3F) | ((q_scales[i*2+1] & 0x03) << 6)
+ *   byte[i*3+1] = ((q_scales[i*2+1] >> 2) & 0x0F) | ((q_mins[i*2] & 0x0F) << 4)
+ *   byte[i*3+2] = ((q_mins[i*2] >> 4) & 0x03) | ((q_mins[i*2+1] & 0x3F) << 2)
+ *
+ * Dequant: w[sb*32 + i] = (sub_scale[sb] * super_scale) * nibble - (sub_min[sb] * super_min)
+ */
+
+/* Unpack 6-bit sub-block scales and mins from packed_scales[12] */
+static __device__ __forceinline__ void unpack_q4k_scales(const uint8_t *packed,
+                                                          float super_scale,
+                                                          float super_min,
+                                                          float *eff_scales,
+                                                          float *eff_mins) {
+    uint8_t q_scales[8], q_mins[8];
+
+    for (int i = 0; i < 4; i++) {
+        uint8_t b0 = packed[i * 3];
+        uint8_t b1 = packed[i * 3 + 1];
+        uint8_t b2 = packed[i * 3 + 2];
+
+        q_scales[i * 2]     = b0 & 0x3F;
+        q_scales[i * 2 + 1] = ((b0 >> 6) & 0x03) | ((b1 & 0x0F) << 2);
+        q_mins[i * 2]       = ((b1 >> 4) & 0x0F) | ((b2 & 0x03) << 4);
+        q_mins[i * 2 + 1]   = (b2 >> 2) & 0x3F;
+    }
+
+    for (int sb = 0; sb < 8; sb++) {
+        eff_scales[sb] = (float)q_scales[sb] * super_scale;
+        eff_mins[sb]   = (float)q_mins[sb] * super_min;
+    }
+}
+
+extern "C" __global__ void vox_gemv_q4_k(float *out,
+                                          const float *x,
+                                          const void *W_q4_k,
+                                          int K,
+                                          int N) {
+    const int WARPS = 8;
+    const int ROWS_PER_WARP = 2;  /* fewer rows per warp since Q4_K blocks are larger */
+    const int ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP;
+
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int base = (int)blockIdx.x * ROWS_PER_BLOCK;
+    if (base >= N) return;
+
+    extern __shared__ float sh_x[];
+    for (int i = tid; i < K; i += (int)blockDim.x) {
+        sh_x[i] = x[i];
+    }
+    __syncthreads();
+
+    int superblocks_per_row = K / 256;
+    size_t row_bytes = (size_t)superblocks_per_row * 148;
+
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int row = base + warp + r * WARPS;
+        if (row >= N) continue;
+
+        const uint8_t *row_data = (const uint8_t *)W_q4_k + (size_t)row * row_bytes;
+
+        float acc = 0.0f;
+        for (int sb_idx = lane; sb_idx < superblocks_per_row; sb_idx += 32) {
+            const uint8_t *block = row_data + (size_t)sb_idx * 148;
+            float super_scale = *(const float *)block;
+            float super_min   = *(const float *)(block + 4);
+            const uint8_t *packed_scales = block + 8;
+            const uint8_t *nibs = block + 20;
+
+            float eff_scales[8], eff_mins[8];
+            unpack_q4k_scales(packed_scales, super_scale, super_min, eff_scales, eff_mins);
+
+            int k_base = sb_idx * 256;
+            float partial = 0.0f;
+            for (int sub = 0; sub < 8; sub++) {
+                float s = eff_scales[sub];
+                float m = eff_mins[sub];
+                const uint8_t *sub_nibs = nibs + sub * 16;
+                int sk = k_base + sub * 32;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t byte = sub_nibs[i];
+                    int lo = byte & 0xF;
+                    int hi = (byte >> 4) & 0xF;
+                    partial += sh_x[sk + 2 * i]     * (s * (float)lo - m);
+                    partial += sh_x[sk + 2 * i + 1] * (s * (float)hi - m);
+                }
+            }
+            acc += partial;
+        }
+
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            out[row] = acc;
+        }
+    }
+}
+
+/* ---- Quantized GEMV with beta accumulation ----
+ * out[N] = beta * out[N] + x[K] @ W_q^T[N, K]
+ * Used for fused residual connections (beta=1.0 for add-to-residual).
+ */
+
+extern "C" __global__ void vox_gemv_q8_0_beta(float *out,
+                                                const float *x,
+                                                const void *W_q8_0,
+                                                int K,
+                                                int N,
+                                                float beta) {
+    const int WARPS = 8;
+    const int ROWS_PER_WARP = 4;
+    const int ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP;
+
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int base = (int)blockIdx.x * ROWS_PER_BLOCK;
+    if (base >= N) return;
+
+    extern __shared__ float sh_x[];
+    for (int i = tid; i < K; i += (int)blockDim.x) {
+        sh_x[i] = x[i];
+    }
+    __syncthreads();
+
+    int blocks_per_row = K / 32;
+    size_t row_bytes = (size_t)blocks_per_row * 36;
+
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int row = base + warp + r * WARPS;
+        if (row >= N) continue;
+
+        const uint8_t *row_data = (const uint8_t *)W_q8_0 + (size_t)row * row_bytes;
+
+        float acc = 0.0f;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const uint8_t *block = row_data + (size_t)b * 36;
+            float scale = *(const float *)block;
+            const int8_t *quants = (const int8_t *)(block + 4);
+
+            int k_base = b * 32;
+            float partial = 0.0f;
+            for (int i = 0; i < 32; i++) {
+                partial += sh_x[k_base + i] * (float)quants[i];
+            }
+            acc += scale * partial;
+        }
+
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            out[row] = beta * out[row] + acc;
+        }
+    }
+}
+
+extern "C" __global__ void vox_gemv_q4_0_beta(float *out,
+                                                const float *x,
+                                                const void *W_q4_0,
+                                                int K,
+                                                int N,
+                                                float beta) {
+    const int WARPS = 8;
+    const int ROWS_PER_WARP = 4;
+    const int ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP;
+
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int base = (int)blockIdx.x * ROWS_PER_BLOCK;
+    if (base >= N) return;
+
+    extern __shared__ float sh_x[];
+    for (int i = tid; i < K; i += (int)blockDim.x) {
+        sh_x[i] = x[i];
+    }
+    __syncthreads();
+
+    int blocks_per_row = K / 32;
+    size_t row_bytes = (size_t)blocks_per_row * 20;
+
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int row = base + warp + r * WARPS;
+        if (row >= N) continue;
+
+        const uint8_t *row_data = (const uint8_t *)W_q4_0 + (size_t)row * row_bytes;
+
+        float acc = 0.0f;
+        for (int b = lane; b < blocks_per_row; b += 32) {
+            const uint8_t *block = row_data + (size_t)b * 20;
+            float scale = *(const float *)block;
+            const uint8_t *nibs = block + 4;
+
+            int k_base = b * 32;
+            float partial = 0.0f;
+            for (int i = 0; i < 16; i++) {
+                uint8_t byte = nibs[i];
+                int lo = (byte & 0xF) - 8;
+                int hi = ((byte >> 4) & 0xF) - 8;
+                partial += sh_x[k_base + 2 * i] * (float)lo;
+                partial += sh_x[k_base + 2 * i + 1] * (float)hi;
+            }
+            acc += scale * partial;
+        }
+
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            out[row] = beta * out[row] + acc;
+        }
+    }
+}
+
+extern "C" __global__ void vox_gemv_q4_k_beta(float *out,
+                                                const float *x,
+                                                const void *W_q4_k,
+                                                int K,
+                                                int N,
+                                                float beta) {
+    const int WARPS = 8;
+    const int ROWS_PER_WARP = 2;
+    const int ROWS_PER_BLOCK = WARPS * ROWS_PER_WARP;
+
+    int tid = (int)threadIdx.x;
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    int base = (int)blockIdx.x * ROWS_PER_BLOCK;
+    if (base >= N) return;
+
+    extern __shared__ float sh_x[];
+    for (int i = tid; i < K; i += (int)blockDim.x) {
+        sh_x[i] = x[i];
+    }
+    __syncthreads();
+
+    int superblocks_per_row = K / 256;
+    size_t row_bytes = (size_t)superblocks_per_row * 148;
+
+    for (int r = 0; r < ROWS_PER_WARP; r++) {
+        int row = base + warp + r * WARPS;
+        if (row >= N) continue;
+
+        const uint8_t *row_data = (const uint8_t *)W_q4_k + (size_t)row * row_bytes;
+
+        float acc = 0.0f;
+        for (int sb_idx = lane; sb_idx < superblocks_per_row; sb_idx += 32) {
+            const uint8_t *block = row_data + (size_t)sb_idx * 148;
+            float super_scale = *(const float *)block;
+            float super_min   = *(const float *)(block + 4);
+            const uint8_t *packed_scales = block + 8;
+            const uint8_t *nibs = block + 20;
+
+            float eff_scales[8], eff_mins[8];
+            unpack_q4k_scales(packed_scales, super_scale, super_min, eff_scales, eff_mins);
+
+            int k_base = sb_idx * 256;
+            float partial = 0.0f;
+            for (int sub = 0; sub < 8; sub++) {
+                float s = eff_scales[sub];
+                float m = eff_mins[sub];
+                const uint8_t *sub_nibs = nibs + sub * 16;
+                int sk = k_base + sub * 32;
+                for (int i = 0; i < 16; i++) {
+                    uint8_t byte = sub_nibs[i];
+                    int lo = byte & 0xF;
+                    int hi = (byte >> 4) & 0xF;
+                    partial += sh_x[sk + 2 * i]     * (s * (float)lo - m);
+                    partial += sh_x[sk + 2 * i + 1] * (s * (float)hi - m);
+                }
+            }
+            acc += partial;
+        }
+
+        acc = warp_reduce_sum(acc);
+        if (lane == 0) {
+            out[row] = beta * out[row] + acc;
+        }
+    }
+}

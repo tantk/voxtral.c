@@ -15,6 +15,7 @@
 
 #include "voxtral.h"
 #include "voxtral_kernels.h"
+#include "voxtral_quant.h"
 #include "voxtral_safetensors.h"
 #ifdef USE_CUDA
 #include "voxtral_cuda.h"
@@ -26,6 +27,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+
+/* Dispatch quantized or bf16 linear (no bias) based on weight availability.
+ * Used at every decoder matmul call site in the CPU fallback path. */
+#define DEC_LINEAR(out, in, field, seq, in_d, out_d) \
+    do { \
+        if (l->field##_weight_q) \
+            vox_linear_nobias_quant(out, in, l->field##_weight_q, seq, in_d, out_d, l->field##_qtype); \
+        else \
+            vox_linear_nobias_bf16(out, in, l->field##_weight_bf16, seq, in_d, out_d); \
+    } while (0)
 
 /* ========================================================================
  * Weight Loading
@@ -343,9 +354,9 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         } else
 #endif
         {
-            vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, seq_len, dim, q_dim);
-            vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, seq_len, dim, kv_dim);
-            vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, seq_len, dim, kv_dim);
+            DEC_LINEAR(q, x_norm, wq, seq_len, dim, q_dim);
+            DEC_LINEAR(k, x_norm, wk, seq_len, dim, kv_dim);
+            DEC_LINEAR(v, x_norm, wv, seq_len, dim, kv_dim);
         }
 
         /* Apply RoPE */
@@ -375,7 +386,7 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
                              head_dim, scale, VOX_DEC_WINDOW, start_pos);
 
         /* Output projection + residual */
-        vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, seq_len, q_dim, dim);
+        DEC_LINEAR(proj_out, attn_out, wo, seq_len, q_dim, dim);
         vox_add_inplace(x, proj_out, seq_len * dim);
 
         /* ---- FFN ---- */
@@ -399,11 +410,11 @@ void vox_decoder_prefill(vox_ctx_t *ctx, const float *input_embeds, int seq_len)
         } else
 #endif
         {
-            vox_linear_nobias_bf16(gate, x_norm, l->w1_weight_bf16, seq_len, dim, hidden);
+            DEC_LINEAR(gate, x_norm, w1, seq_len, dim, hidden);
             vox_silu(gate, seq_len * hidden);
-            vox_linear_nobias_bf16(up, x_norm, l->w3_weight_bf16, seq_len, dim, hidden);
+            DEC_LINEAR(up, x_norm, w3, seq_len, dim, hidden);
             vox_mul_inplace(gate, up, seq_len * hidden);
-            vox_linear_nobias_bf16(ffn_out, gate, l->w2_weight_bf16, seq_len, hidden, dim);
+            DEC_LINEAR(ffn_out, gate, w2, seq_len, hidden, dim);
         }
 
         /* Residual */
@@ -545,9 +556,9 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
         vox_dec_layer_t *l = &dec->layers[layer];
 
         vox_rms_norm(x_norm, x, l->attention_norm, 1, dim, VOX_DEC_NORM_EPS);
-        vox_linear_nobias_bf16(q, x_norm, l->wq_weight_bf16, 1, dim, q_dim);
-        vox_linear_nobias_bf16(k, x_norm, l->wk_weight_bf16, 1, dim, kv_dim);
-        vox_linear_nobias_bf16(v, x_norm, l->wv_weight_bf16, 1, dim, kv_dim);
+        DEC_LINEAR(q, x_norm, wq, 1, dim, q_dim);
+        DEC_LINEAR(k, x_norm, wk, 1, dim, kv_dim);
+        DEC_LINEAR(v, x_norm, wv, 1, dim, kv_dim);
 
         vox_apply_rope(q, rope_freqs, 1, n_heads, head_dim);
         vox_apply_rope(k, rope_freqs, 1, n_kv_heads, head_dim);
@@ -568,7 +579,7 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
                                  head_dim, scale, VOX_DEC_WINDOW, pos);
         }
 
-        vox_linear_nobias_bf16(proj_out, attn_out, l->wo_weight_bf16, 1, q_dim, dim);
+        DEC_LINEAR(proj_out, attn_out, wo, 1, q_dim, dim);
         vox_add_inplace(x, proj_out, dim);
 
         vox_rms_norm(x_norm, x, l->ffn_norm, 1, dim, VOX_DEC_NORM_EPS);
@@ -577,11 +588,11 @@ int vox_decoder_forward(vox_ctx_t *ctx, const float *input_embeds, float *logits
             for (int i = 0; i < dim; i++) x_norm[i] *= (1.0f + ada_s[i]);
         }
 
-        vox_linear_nobias_bf16(gate_buf, x_norm, l->w1_weight_bf16, 1, dim, hidden);
+        DEC_LINEAR(gate_buf, x_norm, w1, 1, dim, hidden);
         vox_silu(gate_buf, hidden);
-        vox_linear_nobias_bf16(up_buf, x_norm, l->w3_weight_bf16, 1, dim, hidden);
+        DEC_LINEAR(up_buf, x_norm, w3, 1, dim, hidden);
         vox_mul_inplace(gate_buf, up_buf, hidden);
-        vox_linear_nobias_bf16(ffn_out, gate_buf, l->w2_weight_bf16, 1, hidden, dim);
+        DEC_LINEAR(ffn_out, gate_buf, w2, 1, hidden, dim);
         vox_add_inplace(x, ffn_out, dim);
     }
 
