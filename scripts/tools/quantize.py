@@ -43,11 +43,13 @@ VQF_TYPE_BF16 = 2
 VQF_TYPE_Q8_0 = 8
 VQF_TYPE_Q4_0 = 10
 VQF_TYPE_Q4_K = 12
+VQF_TYPE_Q6_K = 14
 
 TYPE_NAMES = {
     "Q8_0": VQF_TYPE_Q8_0,
     "Q4_0": VQF_TYPE_Q4_0,
     "Q4_K": VQF_TYPE_Q4_K,
+    "Q6_K": VQF_TYPE_Q6_K,
 }
 
 
@@ -166,10 +168,73 @@ def quantize_q4_k(t):
     return out.tobytes()
 
 
+def quantize_q6_k(t):
+    """Q6_K: 256 values/super-block (8 sub-blocks of 32). Symmetric quantization.
+    super_scale(f32,4B) + scales[8](int8,8B) + ql[128](128B) + qh[64](64B) = 204 bytes."""
+    values = t.flatten().to(device=device, dtype=torch.float32)
+    n = values.numel()
+    pad = (256 - n % 256) % 256
+    if pad:
+        values = torch.nn.functional.pad(values, (0, pad))
+
+    n_blocks = values.numel() // 256
+    subs = values.reshape(n_blocks, 8, 32)
+
+    # Per-sub-block: symmetric scale = amax / 31.0  (maps to [-32, 31])
+    sub_amax = subs.abs().amax(dim=2)  # [n_blocks, 8]
+    sub_scales = torch.where(sub_amax > 0, sub_amax / 31.0, sub_amax.new_zeros(()))
+
+    # Super-block: super_scale = max(sub_scales) / 127.0
+    max_sub_scale = sub_scales.amax(dim=1)  # [n_blocks]
+    super_scale = torch.where(max_sub_scale > 0, max_sub_scale / 127.0, max_sub_scale.new_zeros(()))
+
+    # Quantize sub_scales to int8 (signed, range -127..127, but scales are positive so 0..127)
+    inv_ss = torch.where(super_scale > 0, 1.0 / super_scale, super_scale.new_zeros(()))
+    q_scales = (sub_scales * inv_ss[:, None]).round().clamp(0, 127).to(torch.int8)
+
+    # Effective scale per sub-block for quantizing values
+    eff_scales = q_scales.float() * super_scale[:, None]
+    inv_eff = torch.where(eff_scales > 0, 1.0 / eff_scales, eff_scales.new_zeros(()))
+
+    # Quantize to 6-bit unsigned (0-63), centered at 32
+    q6 = (subs * inv_eff[:, :, None] + 32).round().clamp(0, 63).to(torch.uint8)
+
+    # Split into ql (lower 4 bits, nibble packed) and qh (upper 2 bits, 4 per byte)
+    ql_raw = q6 & 0xF  # [n_blocks, 8, 32] lower nibbles
+    qh_raw = (q6 >> 4) & 0x3  # [n_blocks, 8, 32] upper 2 bits
+
+    # Pack ql: nibble pairs like Q4 (lo=even, hi=odd)
+    lo = ql_raw[:, :, 0::2]  # [n_blocks, 8, 16]
+    hi = ql_raw[:, :, 1::2]
+    ql_packed = ((lo & 0xF) | ((hi & 0xF) << 4)).reshape(n_blocks, 128)
+
+    # Pack qh: 4 values per byte (2 bits each)
+    # For each sub-block of 32 values, we have 32 * 2 bits = 64 bits = 8 bytes
+    qh_reshaped = qh_raw.reshape(n_blocks, 8, 8, 4)  # [n_blocks, 8, 8_bytes, 4_values_per_byte]
+    qh_packed = (qh_reshaped[:, :, :, 0] |
+                 (qh_reshaped[:, :, :, 1] << 2) |
+                 (qh_reshaped[:, :, :, 2] << 4) |
+                 (qh_reshaped[:, :, :, 3] << 6)).reshape(n_blocks, 64)
+
+    # Move to CPU for final byte packing
+    ss_np = super_scale.cpu().numpy()
+    qs_np = q_scales.cpu().numpy()
+    ql_np = ql_packed.cpu().numpy()
+    qh_np = qh_packed.cpu().numpy()
+
+    out = np.empty((n_blocks, 204), dtype=np.uint8)
+    out[:, 0:4] = ss_np.view(np.uint8).reshape(-1, 4)
+    out[:, 4:12] = qs_np.view(np.uint8)
+    out[:, 12:140] = ql_np
+    out[:, 140:204] = qh_np
+    return out.tobytes()
+
+
 QUANTIZE_FN = {
     VQF_TYPE_Q8_0: quantize_q8_0,
     VQF_TYPE_Q4_0: quantize_q4_0,
     VQF_TYPE_Q4_K: quantize_q4_k,
+    VQF_TYPE_Q6_K: quantize_q6_k,
 }
 
 
@@ -202,6 +267,8 @@ def vqf_tensor_bytes(qtype, numel):
         return ((numel + 31) // 32) * 20
     elif qtype == VQF_TYPE_Q4_K:
         return ((numel + 255) // 256) * 148
+    elif qtype == VQF_TYPE_Q6_K:
+        return ((numel + 255) // 256) * 204
     return numel * 2
 
 
