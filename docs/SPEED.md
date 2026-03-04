@@ -10,7 +10,7 @@
 ## Testing
 - **Quick iteration**: use short samples in `samples/` (test_speech.wav, jfk.wav)
   for timing measurements during development
-- **Before committing**: run `./runtest.sh` to verify no regressions (batch +
+- **Before committing**: run `./scripts/runtest.sh` to verify no regressions (batch +
   streaming with KV cache compaction). This is slow (~2 min), so only run it as
   the final check before each commit
 

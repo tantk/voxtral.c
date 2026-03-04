@@ -65,7 +65,7 @@ make blas
 ## Validation
 
 ```bash
-./download_model.sh
+./scripts/download_model.sh
 
 make cuda
 ./scripts/validate_cuda.sh voxtral-model samples/test_speech.wav

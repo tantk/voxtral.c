@@ -179,20 +179,20 @@ debug:
 # Weight inspector utility
 # =============================================================================
 inspect: CFLAGS = $(CFLAGS_BASE)
-inspect: inspect_weights.o voxtral_safetensors.o
+inspect: scripts/inspect_weights.o voxtral_safetensors.o
 	$(CC) $(CFLAGS) -o inspect_weights $^ $(LDFLAGS)
 
 # =============================================================================
 # Test
 # =============================================================================
 test:
-	@./runtest.sh
+	@./scripts/runtest.sh
 
 # =============================================================================
 # Utilities
 # =============================================================================
 clean:
-	rm -f $(OBJS) voxtral_cuda.o voxtral_cuda_quant.o *.mps.o voxtral_metal.o main.o inspect_weights.o $(TARGET) inspect_weights
+	rm -f $(OBJS) voxtral_cuda.o voxtral_cuda_quant.o *.mps.o voxtral_metal.o main.o scripts/inspect_weights.o $(TARGET) inspect_weights
 	rm -f voxtral_shaders_source.h
 	rm -f $(CUDA_CUBIN) $(CUDA_CUBIN_HDR)
 
@@ -227,7 +227,8 @@ voxtral_quant_loader.o: voxtral_quant_loader.c voxtral_quant.h voxtral.h
 voxtral_quant_kernels.o: voxtral_quant_kernels.c voxtral_quant.h voxtral_kernels.h
 main.o: main.c voxtral.h voxtral_kernels.h voxtral_mic.h
 voxtral_mic_macos.o: voxtral_mic_macos.c voxtral_mic.h
-inspect_weights.o: inspect_weights.c voxtral_safetensors.h
+scripts/inspect_weights.o: scripts/inspect_weights.c voxtral_safetensors.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
 
 # =============================================================================
 # CUDA kernels: compile .cu -> CUBIN -> embed as C header

@@ -10,7 +10,7 @@ Audio processing uses a chunked encoder with overlapping windows, bounding memor
 
 ## Motivations (and some rant)
 
-**Thank you to Mistral** for releasing such a great model in an Open Weights fashion. However, the author of this project believes that limiting the inference to a partnership with vLLM, without providing a self-contained reference implementation in Python, limits the model's actual reach and the potential good effects it could have. For this reason, this project was created: it provides both a pure C inference engine and a simple, self-contained Python reference implementation (`python_simple_implementation.py`) that anyone can read and understand without digging through the vLLM codebase.
+**Thank you to Mistral** for releasing such a great model in an Open Weights fashion. However, the author of this project believes that limiting the inference to a partnership with vLLM, without providing a self-contained reference implementation in Python, limits the model's actual reach and the potential good effects it could have. For this reason, this project was created: it provides both a pure C inference engine and a simple, self-contained Python reference implementation (`scripts/python_simple_implementation.py`) that anyone can read and understand without digging through the vLLM codebase.
 
 ## Quick Start
 
@@ -21,7 +21,7 @@ make mps       # Apple Silicon (fastest)
 # or: make cuda    # NVIDIA CUDA/cuBLAS (Linux/WSL2)
 
 # Download the model (~8.9GB)
-./download_model.sh
+./scripts/download_model.sh
 
 # Transcribe audio (tokens stream to stdout as generated)
 ./voxtral -d voxtral-model -i audio.wav
@@ -46,7 +46,7 @@ A self-contained Python implementation is also provided for reading and understa
 
 ```bash
 pip install torch safetensors soundfile soxr
-python python_simple_implementation.py voxtral-model audio.wav
+python scripts/python_simple_implementation.py voxtral-model audio.wav
 ```
 
 This requires just PyTorch and a few standard libraries.
@@ -301,7 +301,7 @@ make inspect    # Build safetensors weight inspector
 Download model weights (~8.9GB) from HuggingFace:
 
 ```bash
-./download_model.sh
+./scripts/download_model.sh
 ```
 
 This downloads to `./voxtral-model/` containing:
@@ -477,4 +477,4 @@ If `pulse` is unavailable in your WSL distribution, use a host-side capture path
 
 ### CUDA / WSL2 Notes
 
-For detailed bringup, benchmark results, and profiling notes, see `PR_NOTES_CUDA_WSL2.md`.
+For detailed bringup, benchmark results, and profiling notes, see `docs/PR_NOTES_CUDA_WSL2.md`.

@@ -4,7 +4,7 @@ Model: `mistralai/Voxtral-Mini-4B-Realtime-2602`
 
 This document describes the model architecture, weight format, tokenizer layout,
 and inference algorithm needed to implement Voxtral Realtime 4B from scratch.
-The Python reference implementation (`python_simple_implementation.py`) is the
+The Python reference implementation (`scripts/python_simple_implementation.py`) is the
 executable version of this document.
 
 ---

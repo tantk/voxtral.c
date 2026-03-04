@@ -31,10 +31,10 @@ cat audio.wav | ./voxtral -d voxtral-model --stdin
 ffmpeg -i samples/I_have_a_dream.ogg -f s16le -ar 16000 -ac 1 - | ./voxtral -d voxtral-model --stdin
 
 # Download model (~8.9GB)
-./download_model.sh
+./scripts/download_model.sh
 
 # Python reference implementation (self-contained, no mistral_common needed)
-./pyenv312/bin/python python_simple_implementation.py voxtral-model test_speech.wav
+./pyenv312/bin/python scripts/python_simple_implementation.py voxtral-model test_speech.wav
 ```
 
 ## Key Files
@@ -53,8 +53,8 @@ voxtral_mic.h               - Microphone capture API
 voxtral_mic_macos.c         - macOS mic capture (AudioQueue)
 voxtral_metal.m/.h          - Metal GPU backend
 voxtral_shaders.metal       - Metal compute shaders
-python_simple_implementation.py - Self-contained Python reference
-MODEL.md                    - Architecture & weight format reference
+scripts/python_simple_implementation.py - Self-contained Python reference
+docs/MODEL.md               - Architecture & weight format reference
 vllm/                       - Upstream vLLM clone (official reference)
 ```
 
@@ -84,7 +84,7 @@ CLI: `--alt <cutoff>` formats output as `[best|alt1|alt2]` when alternatives exi
 
 ## Architecture
 
-See MODEL.md for full architecture details, weight tensor names, tokenizer layout, and decode schedule.
+See docs/MODEL.md for full architecture details, weight tensor names, tokenizer layout, and decode schedule.
 
 ## Development Rules
 
@@ -96,7 +96,7 @@ See MODEL.md for full architecture details, weight tensor names, tokenizer layou
 6. Standard C only (no compiler-specific tricks)
 7. WAV file input, stdin (WAV or raw s16le 16kHz mono), or microphone (macOS)
 8. BF16 weights, F32 computation on CPU
-9. Keep MODEL.md updated as the architecture reference
+9. Keep docs/MODEL.md updated as the architecture reference
 
 ## Reference Audio
 
