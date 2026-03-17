@@ -143,11 +143,27 @@ vox_ctx_t *vox_load(const char *model_dir) {
     ctx->delay_tokens = 6; /* 480ms default */
     ctx->use_bf16 = 1; /* bf16 mmap direct mode */
 
-    /* Try VQF quantized file first, fall back to safetensors */
+    /* Try VQF quantized file first, fall back to safetensors.
+       Scan common names: consolidated.vqf, then consolidated-{variant}.vqf */
     char path[1024];
-    snprintf(path, sizeof(path), "%s/consolidated.vqf", model_dir);
-
-    vqf_mapped_file_t *vf = vqf_open(path);
+    vqf_mapped_file_t *vf = NULL;
+    static const char *vqf_names[] = {
+        "consolidated.vqf",
+        "consolidated-q4_k.vqf",
+        "consolidated-q6_k.vqf",
+        "consolidated-q8_0.vqf",
+        "consolidated-q4_0.vqf",
+        NULL
+    };
+    for (int i = 0; vqf_names[i]; i++) {
+        snprintf(path, sizeof(path), "%s/%s", model_dir, vqf_names[i]);
+        vf = vqf_open(path);
+        if (vf) {
+            if (vox_verbose >= 1)
+                fprintf(stderr, "Found quantized weights: %s\n", vqf_names[i]);
+            break;
+        }
+    }
     if (vf) {
         /* ---- Quantized VQF path ---- */
         ctx->vqf_file = vf;
